@@ -1,0 +1,37 @@
+{
+  "server": {
+    "base_url": "http://127.0.0.1:30000",
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "tokenizer": null,
+    "ready_timeout_seconds": 300,
+    "flush_before_run": true,
+    "clear_storage_before_run": false
+  },
+  "storage": {
+    "path": "/root/data/sglang-hicache",
+    "device": null,
+    "transfer_trace_glob": null,
+    "monitor_interval_ms": 100
+  },
+  "workload": {
+    "num_clients": 8,
+    "prefix_tokens": 4096,
+    "eviction_prompts": 32,
+    "eviction_tokens": 4096,
+    "output_tokens": 32,
+    "offload_output_tokens": 128,
+    "max_concurrency": 4,
+    "seed": 1,
+    "request_timeout_seconds": 3600,
+    "phase_pause_seconds": 2,
+    "flush_before_measure": true,
+    "flush_timeout_seconds": 300,
+    "clear_storage_timeout_seconds": 300,
+    "flush_settle_seconds": 1,
+    "require_storage_hits": true,
+    "minimum_storage_hit_fraction": 1.0
+  },
+  "output": {
+    "root_dir": "benchmark/hicache/ssd/results"
+  }
+}

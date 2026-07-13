@@ -46,6 +46,10 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.observability.hicache_transfer_trace import (
+    HiCacheTransferTracer,
+    transfer_event,
+)
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -166,6 +170,10 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        self.enqueue_ns = time.monotonic_ns()
+        self.io_start_ns = None
+        self.io_end_ns = None
+        self.error = None
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -260,6 +268,7 @@ class HiCacheController:
 
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
+        self.transfer_tracer = HiCacheTransferTracer()
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -300,6 +309,35 @@ class HiCacheController:
             except ValueError as e:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
+
+    def _storage_backend_name(self) -> Optional[str]:
+        backend = getattr(self, "storage_backend", None)
+        return type(backend).__name__ if backend is not None else None
+
+    def _storage_bytes_per_token(self) -> int:
+        return int(getattr(self.mem_pool_host, "size_per_token", 0))
+
+    def _emit_storage_transfer(
+        self, operation, operation_type: str, status: str
+    ) -> None:
+        io_end_ns = operation.io_end_ns or time.monotonic_ns()
+        self.transfer_tracer.emit(
+            transfer_event(
+                operation=operation_type,
+                operation_id=operation.id,
+                request_id=getattr(operation, "request_id", None),
+                status=status,
+                enqueue_ns=operation.enqueue_ns,
+                io_start_ns=operation.io_start_ns,
+                io_end_ns=io_end_ns,
+                requested_tokens=len(operation.token_ids),
+                completed_tokens=operation.completed_tokens,
+                page_size=self.page_size,
+                bytes_per_token=self._storage_bytes_per_token(),
+                storage_backend=self._storage_backend_name(),
+                error=operation.error,
+            )
+        )
 
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
         """Derive CP rank/size from the attn_cp process group."""
@@ -977,7 +1015,22 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_transfer(operation)
+                operation.io_start_ns = time.monotonic_ns()
+                try:
+                    self._page_transfer(operation)
+                except Exception as exc:
+                    operation.error = f"{type(exc).__name__}: {exc}"
+                    raise
+                finally:
+                    operation.io_end_ns = time.monotonic_ns()
+                    status = (
+                        "completed"
+                        if operation.completed_tokens == len(operation.host_indices)
+                        else "partial"
+                    )
+                    if operation.error is not None:
+                        status = "failed"
+                    self._emit_storage_transfer(operation, "prefetch", status)
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]
@@ -1052,6 +1105,8 @@ class HiCacheController:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
+                    operation.io_end_ns = time.monotonic_ns()
+                    self._emit_storage_transfer(operation, "prefetch", "revoked")
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
@@ -1204,8 +1259,25 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
-                    self._page_backup(operation)
+                operation.io_start_ns = time.monotonic_ns()
+                try:
+                    if not self.backup_skip:
+                        self._page_backup(operation)
+                except Exception as exc:
+                    operation.error = f"{type(exc).__name__}: {exc}"
+                    raise
+                finally:
+                    operation.io_end_ns = time.monotonic_ns()
+                    status = (
+                        "completed"
+                        if operation.completed_tokens == len(operation.token_ids)
+                        else "partial"
+                    )
+                    if self.backup_skip:
+                        status = "skipped"
+                    if operation.error is not None:
+                        status = "failed"
+                    self._emit_storage_transfer(operation, "backup", status)
                 self.ack_backup_queue.put(operation)
 
             except Empty:

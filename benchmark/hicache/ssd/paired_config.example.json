@@ -1,0 +1,50 @@
+{
+  "base_config": "benchmark/hicache/ssd/config.example.json",
+  "output_root": "benchmark/hicache/ssd/paired-results",
+  "repetitions": 10,
+  "random_seed": 20260713,
+  "stop_on_failure": true,
+  "conditions": {
+    "stable": {
+      "description": "Constant 500 MiB/s read service rate",
+      "bandwidth_control": {
+        "enabled": true,
+        "backend": "cgroup_v2",
+        "cgroup_path": "/sys/fs/cgroup/sglang-hicache",
+        "device": "/dev/nvme1n1",
+        "target_read_mib_s": 500,
+        "mean_relative_tolerance": 1e-06,
+        "schedule": [
+          {
+            "duration_seconds": 2,
+            "read_mib_s": 500
+          }
+        ],
+        "measurement_mean_relative_tolerance": 0.05
+      }
+    },
+    "fluctuating": {
+      "description": "Alternating 100/900 MiB/s with the same 500 MiB/s time average",
+      "bandwidth_control": {
+        "enabled": true,
+        "backend": "cgroup_v2",
+        "cgroup_path": "/sys/fs/cgroup/sglang-hicache",
+        "device": "/dev/nvme1n1",
+        "target_read_mib_s": 500,
+        "mean_relative_tolerance": 1e-06,
+        "schedule": [
+          {
+            "duration_seconds": 2,
+            "read_mib_s": 100
+          },
+          {
+            "duration_seconds": 2,
+            "read_mib_s": 900
+          }
+        ],
+        "randomize_start_segment": true,
+        "measurement_mean_relative_tolerance": 0.05
+      }
+    }
+  }
+}
