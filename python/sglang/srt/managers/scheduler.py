@@ -3495,6 +3495,8 @@ class Scheduler(
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
+            # Feed prefill cost calibration to the cost_aware prefetch-stop policy.
+            self._maybe_calibrate_prefetch_cost_aware(batch)
         elif batch.forward_mode.is_prebuilt():
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
@@ -3509,6 +3511,33 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _maybe_calibrate_prefetch_cost_aware(self, batch: ScheduleBatch):
+        """Feed measured prefill step cost to the cost_aware prefetch-stop policy.
+
+        Only active when hicache storage is on and the policy is "cost_aware".
+        Uses a lightweight wall-clock delta between consecutive prefill (extend)
+        steps as a per-step GPU-time proxy; the tree cache converts it to a
+        per-token EMA. Cheap: a few attribute reads and one float update.
+        """
+        if not self.enable_hicache_storage:
+            return
+        tree_cache = self.tree_cache
+        if getattr(tree_cache, "prefetch_stop_policy", None) != "cost_aware":
+            return
+        step_tokens = getattr(batch, "extend_num_tokens", None)
+        if not step_tokens or step_tokens <= 0:
+            return
+        now = time.monotonic()
+        last = getattr(self, "_cost_aware_last_prefill_tic", None)
+        self._cost_aware_last_prefill_tic = now
+        if last is None:
+            return
+        step_time = now - last
+        # Guard against absurd gaps (idle periods) polluting the EMA.
+        if step_time <= 0 or step_time > 5.0:
+            return
+        tree_cache.update_prefill_perf(step_time, int(step_tokens))
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:

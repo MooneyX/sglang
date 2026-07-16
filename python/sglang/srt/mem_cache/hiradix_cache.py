@@ -197,6 +197,12 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+
+        # Online-calibrated prefill compute cost, used by the "cost_aware"
+        # prefetch-stop policy. Seconds of prefill GPU time per token, updated
+        # via update_prefill_perf() as an EMA. None until first calibration.
+        self._prefill_time_per_token: Optional[float] = None
+
         self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
@@ -379,7 +385,7 @@ class HiRadixCache(RadixCache):
         """
         # Validate inputs first (no side effects).
         if hicache_storage_prefetch_policy is not None:
-            allowed = ["best_effort", "wait_complete", "timeout"]
+            allowed = ["best_effort", "wait_complete", "timeout", "cost_aware"]
             if hicache_storage_prefetch_policy not in allowed:
                 return (
                     False,
@@ -690,6 +696,26 @@ class HiRadixCache(RadixCache):
         hicache_storage_pass_prefix_keys = extra_config.pop(
             "hicache_storage_pass_prefix_keys", False
         )
+
+        # cost_aware prefetch-stop policy knobs (see DESIGN_cost_aware_prefetch.md).
+        cost_aware_gamma = extra_config.pop("cost_aware_gamma", 1.0)
+        cost_aware_perf_ema_alpha = extra_config.pop(
+            "cost_aware_perf_ema_alpha", 0.1
+        )
+        if not isinstance(cost_aware_gamma, (int, float)) or cost_aware_gamma <= 0:
+            raise ValueError(
+                f"cost_aware_gamma must be a positive number, got {cost_aware_gamma!r}"
+            )
+        if (
+            not isinstance(cost_aware_perf_ema_alpha, (int, float))
+            or not (0.0 < cost_aware_perf_ema_alpha <= 1.0)
+        ):
+            raise ValueError(
+                "cost_aware_perf_ema_alpha must be in (0, 1], got "
+                f"{cost_aware_perf_ema_alpha!r}"
+            )
+        self.cost_aware_gamma = float(cost_aware_gamma)
+        self.cost_aware_perf_ema_alpha = float(cost_aware_perf_ema_alpha)
 
         if not isinstance(prefetch_threshold, int):
             raise ValueError(
@@ -1440,6 +1466,57 @@ class HiRadixCache(RadixCache):
         timeout = min(cfg.max, cfg.base + cfg.per_ki_token * num_tokens / 1024)
         return time.monotonic() - operation.start_time > timeout
 
+    def update_prefill_perf(self, step_gpu_time: float, step_tokens: int) -> None:
+        """Feed one prefill step's measured cost to calibrate per-token prefill time.
+
+        Called by the scheduler after a prefill (extend) step. Maintains an EMA
+        of seconds-of-prefill-GPU-time per token, consumed by the "cost_aware"
+        prefetch-stop policy. Cheap and lock-free; only reads/writes one float.
+        """
+        if step_tokens <= 0 or step_gpu_time <= 0:
+            return
+        sample = float(step_gpu_time) / float(step_tokens)
+        if self._prefill_time_per_token is None:
+            self._prefill_time_per_token = sample
+        else:
+            alpha = self.cost_aware_perf_ema_alpha
+            self._prefill_time_per_token = (
+                alpha * sample + (1.0 - alpha) * self._prefill_time_per_token
+            )
+
+    def _cost_aware_can_terminate(self, operation: PrefetchOperation) -> bool:
+        """Cost-aware prefetch-stop decision.
+
+        Compare the transfer time to finish the not-yet-prefetched part against
+        the prefill compute time that reusing that part would save. Keep waiting
+        only while waiting is cheaper than recomputing. Falls back to the linear
+        timeout policy whenever the required estimates are unavailable.
+        """
+        total = len(operation.hash_value) * self.page_size
+        done = operation.completed_tokens
+        remaining = total - done
+        if remaining <= 0:
+            # Nothing left to fetch -> already complete, safe to terminate.
+            return True
+
+        # Need a positive transfer rate and a calibrated compute cost; otherwise
+        # we cannot compare the two sides -> fall back to timeout behavior.
+        elapsed = time.monotonic() - operation.start_time
+        if done <= 0 or elapsed <= 0 or self._prefill_time_per_token is None:
+            return self.is_prefetch_timeout(operation)
+
+        prefetch_rate = done / elapsed  # tokens/s, measured online
+        if prefetch_rate <= 0:
+            return self.is_prefetch_timeout(operation)
+
+        t_wait = remaining / prefetch_rate  # s to finish fetching the rest
+        t_save = remaining * self._prefill_time_per_token  # s of prefill saved
+
+        # Worth waiting while the compute time saved exceeds the wait cost.
+        if t_save > self.cost_aware_gamma * t_wait:
+            return False  # keep prefetching
+        return True  # stop now, use the already-fetched part
+
     def can_terminate_prefetch(self, operation: PrefetchOperation):
         can_terminate = True
 
@@ -1457,6 +1534,8 @@ class HiRadixCache(RadixCache):
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
             can_terminate = completed or self.is_prefetch_timeout(operation)
+        elif self.prefetch_stop_policy == "cost_aware":
+            can_terminate = completed or self._cost_aware_can_terminate(operation)
         else:
             # unknown prefetch stop policy, just return True
             return True
