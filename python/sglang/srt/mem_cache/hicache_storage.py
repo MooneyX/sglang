@@ -382,6 +382,22 @@ class HiCacheFile(HiCacheStorage):
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
+        # Optional read throttle to emulate a slow remote L3 tier (for benchmarking
+        # prefetch-stop policies). Per-page delay in milliseconds; 0 disables.
+        # Set via env SGLANG_HICACHE_FILE_BACKEND_GET_DELAY_MS.
+        self._get_delay_s = 0.0
+        try:
+            _delay_ms = float(
+                os.environ.get("SGLANG_HICACHE_FILE_BACKEND_GET_DELAY_MS", "0") or "0"
+            )
+            if _delay_ms > 0:
+                self._get_delay_s = _delay_ms / 1000.0
+                logger.info(
+                    f"HiCacheFile read throttle enabled: {_delay_ms} ms/page"
+                )
+        except (TypeError, ValueError):
+            self._get_delay_s = 0.0
+
         # Metadata cache positive lookup toggle & TTL
         enable_cache_raw = None
         if storage_config.extra_config:
@@ -481,6 +497,8 @@ class HiCacheFile(HiCacheStorage):
         target_locations: List[torch.Tensor],
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
+        if self._get_delay_s > 0:
+            time.sleep(self._get_delay_s * len(keys))
         return [
             self.get(key, target_location)
             for key, target_location in zip(

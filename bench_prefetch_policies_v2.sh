@@ -12,19 +12,22 @@ LOG_DIR=/tmp/bench_logs2
 mkdir -p "$RESULT_DIR" "$LOG_DIR"
 
 # Heavy shared-prefix workload: long prefix (big KV to prefetch) + high concurrency.
-GSP_GROUPS="${GSP_GROUPS:-16}"
-GSP_PER_GROUP="${GSP_PER_GROUP:-12}"
-GSP_SYS_LEN="${GSP_SYS_LEN:-8192}"     # long shared prefix -> large KV transfer
-GSP_Q_LEN="${GSP_Q_LEN:-256}"
+GSP_GROUPS="${GSP_GROUPS:-8}"
+GSP_PER_GROUP="${GSP_PER_GROUP:-10}"
+GSP_SYS_LEN="${GSP_SYS_LEN:-4096}"     # long shared prefix -> large KV transfer
+GSP_Q_LEN="${GSP_Q_LEN:-128}"
 GSP_OUT_LEN="${GSP_OUT_LEN:-64}"
 NUM_PROMPTS=$((GSP_GROUPS * GSP_PER_GROUP))
-REQ_RATE="${REQ_RATE:-24}"             # high rate -> real queuing
+REQ_RATE="${REQ_RATE:-6}"              # calibrated: 14B single-card saturates ~4.3 req/s
+# Emulate slow remote L3 so the wait-vs-recompute trade-off is visible.
+GET_DELAY_MS="${GET_DELAY_MS:-4}"      # per-page read delay (ms) in file backend
 
 start_server () {
   local policy="$1"
   local logf="$LOG_DIR/server_${policy}.log"
   rm -rf "$HICACHE_DIR"; mkdir -p "$HICACHE_DIR"
   SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$HICACHE_DIR" \
+  SGLANG_HICACHE_FILE_BACKEND_GET_DELAY_MS="$GET_DELAY_MS" \
   python -m sglang.launch_server \
     --model-path "$MODEL" \
     --host 127.0.0.1 --port "$PORT" \
