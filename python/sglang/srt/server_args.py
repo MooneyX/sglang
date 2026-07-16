@@ -1914,7 +1914,7 @@ class ServerArgs:
         str,
         Arg(
             help="Control when prefetching from the storage backend should stop.",
-            choices=["best_effort", "wait_complete", "timeout"],
+            choices=["best_effort", "wait_complete", "timeout", "cost_aware"],
         ),
     ] = "timeout"
     hicache_storage_backend_extra_config: A[
