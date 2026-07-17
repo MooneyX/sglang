@@ -14,8 +14,11 @@ GSP_GROUPS=8; GSP_PER_GROUP=10; GSP_SYS_LEN=4096; GSP_Q_LEN=128; GSP_OUT_LEN=64
 NUM_PROMPTS=$((GSP_GROUPS*GSP_PER_GROUP)); REQ_RATE=6
 
 start_server () {
-  local delay="$1" hdir="/tmp/hicache_ab_${delay}"
-  rm -rf "$hdir"; mkdir -p "$hdir"
+  local delay="$1" wipe="${2:-0}" hdir="/tmp/hicache_ab_${delay}"
+  # Only wipe L3 on the warm (first) start; the measure restart MUST keep the
+  # L3 files populated by warm, otherwise prefetch queries hit an empty L3.
+  if [ "$wipe" = "1" ]; then rm -rf "$hdir"; fi
+  mkdir -p "$hdir"
   SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$hdir" \
   SGLANG_HICACHE_FILE_BACKEND_GET_DELAY_MS="$delay" \
   python -m sglang.launch_server --model-path "$MODEL" --host 127.0.0.1 --port "$PORT" \
@@ -34,11 +37,14 @@ stop () { kill "$1" 2>/dev/null; for i in $(seq 1 40); do kill -0 "$1" 2>/dev/nu
 
 for delay in 0 30; do
   echo "########## DELAY=${delay}ms ##########"
-  PID=$(start_server "$delay"); wait_ready || { echo "start failed d=$delay"; tail -n 20 "$LOG_DIR/server_d${delay}.log"; stop "$PID"; continue; }
+  PID=$(start_server "$delay" 1); wait_ready || { echo "start failed d=$delay"; tail -n 20 "$LOG_DIR/server_d${delay}.log"; stop "$PID"; continue; }
   bench "$RES_DIR/warm_d${delay}.json" "$LOG_DIR/bench_warm_d${delay}.log"; stop "$PID"; sleep 3
-  PID=$(start_server "$delay"); wait_ready || { echo "restart failed d=$delay"; stop "$PID"; continue; }
+  echo "[d=$delay] L3_files_after_warm: $(ls /tmp/hicache_ab_${delay} 2>/dev/null | wc -l)"
+  PID=$(start_server "$delay" 0); wait_ready || { echo "restart failed d=$delay"; stop "$PID"; continue; }
+  echo "[d=$delay] L3_files_at_measure_start: $(ls /tmp/hicache_ab_${delay} 2>/dev/null | wc -l)"
   bench "$RES_DIR/measure_d${delay}.json" "$LOG_DIR/bench_measure_d${delay}.log"
   echo "[d=$delay] prefetch_completed_loglines: $(grep -c 'Prefetch .* completed with' "$LOG_DIR/server_d${delay}.log")"
+  echo "[d=$delay] prefetch_nonzero_tokens: $(grep -oE 'completed with [1-9][0-9]* tokens' "$LOG_DIR/server_d${delay}.log" | wc -l)"
   echo "[d=$delay] throttle_enabled_log: $(grep -c 'read throttle enabled' "$LOG_DIR/server_d${delay}.log")"
   stop "$PID"; sleep 3
 done
