@@ -23,10 +23,15 @@ REQ_RATE="${REQ_RATE:-6}"              # calibrated: 14B single-card saturates ~
 GET_DELAY_MS="${GET_DELAY_MS:-4}"      # per-page read delay (ms) in file backend
 
 start_server () {
-  local policy="$1"
+  local policy="$1" wipe="${2:-0}"
   local logf="$LOG_DIR/server_${policy}.log"
-  rm -rf "$HICACHE_DIR"; mkdir -p "$HICACHE_DIR"
-  SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$HICACHE_DIR" \
+  local hdir="${HICACHE_DIR}_${policy}"   # per-policy L3 dir: no cross-policy contamination
+  # Only wipe L3 on the warm (first) start. The measure restart MUST keep the
+  # L3 files written by warm, otherwise prefetch queries hit an empty L3
+  # (the rm -rf here was the root cause of all "0-token prefetch" results).
+  if [ "$wipe" = "1" ]; then rm -rf "$hdir"; fi
+  mkdir -p "$hdir"
+  SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$hdir" \
   SGLANG_HICACHE_FILE_BACKEND_GET_DELAY_MS="$GET_DELAY_MS" \
   python -m sglang.launch_server \
     --model-path "$MODEL" \
@@ -38,7 +43,7 @@ start_server () {
     --hicache-storage-prefetch-policy "$policy" \
     --hicache-storage-backend-extra-config '{"prefetch_threshold":32,"cost_aware_gamma":1.0}' \
     --max-running-requests 32 \
-    --log-level info \
+    --log-level debug \
     > "$logf" 2>&1 &
   echo $!
 }
@@ -75,17 +80,21 @@ stop_server () {
 }
 
 POLICIES="${POLICIES:-best_effort wait_complete timeout cost_aware}"
-echo "=== BENCH2 START $(date) model=$MODEL sys_len=$GSP_SYS_LEN rate=$REQ_RATE n=$NUM_PROMPTS ==="
+rm -f "$RESULT_DIR"/*.json    # avoid JSONL append pollution across runs
+echo "=== BENCH2 START $(date) model=$MODEL sys_len=$GSP_SYS_LEN rate=$REQ_RATE n=$NUM_PROMPTS delay=${GET_DELAY_MS}ms ==="
 for pol in $POLICIES; do
   echo "########## POLICY=$pol ##########"
-  PID=$(start_server "$pol")
+  PID=$(start_server "$pol" 1)
   if ! wait_ready; then echo "[$pol] server failed (warm)"; tail -n 30 "$LOG_DIR/server_${pol}.log"; stop_server "$PID"; continue; fi
   run_bench "$pol" warm "$RESULT_DIR/${pol}_warm.json"
   stop_server "$PID"
+  echo "[$pol] L3_files_after_warm: $(ls ${HICACHE_DIR}_${pol} 2>/dev/null | wc -l)"
   sleep 3
-  PID=$(start_server "$pol")
+  PID=$(start_server "$pol" 0)
   if ! wait_ready; then echo "[$pol] server failed (measure)"; tail -n 30 "$LOG_DIR/server_${pol}.log"; stop_server "$PID"; continue; fi
+  echo "[$pol] L3_files_at_measure_start: $(ls ${HICACHE_DIR}_${pol} 2>/dev/null | wc -l)"
   run_bench "$pol" measure "$RESULT_DIR/${pol}_measure.json"
+  echo "[$pol] prefetch_nonzero_tokens: $(grep -oE 'completed with [1-9][0-9]* tokens' "$LOG_DIR/server_${pol}.log" | wc -l)"
   grep -iE "prefetch|storage_hit|revok|terminate" "$LOG_DIR/server_${pol}.log" | tail -n 60 > "$LOG_DIR/prefetch_${pol}.log"
   stop_server "$PID"
   sleep 3

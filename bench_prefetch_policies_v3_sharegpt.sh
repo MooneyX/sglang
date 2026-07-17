@@ -13,13 +13,18 @@ LOG_DIR=/tmp/bench_logs3
 mkdir -p "$RESULT_DIR" "$LOG_DIR"
 
 NUM_PROMPTS="${NUM_PROMPTS:-400}"
-REQ_RATE="${REQ_RATE:-24}"
+REQ_RATE="${REQ_RATE:-6}"              # calibrated: 14B single-card saturates ~4.3 req/s
+GET_DELAY_MS="${GET_DELAY_MS:-4}"      # emulate slow remote L3
+SEED="${SEED:-42}"                     # same seed both rounds -> identical prompts -> L3 keys match
 
 start_server () {
-  local policy="$1"
+  local policy="$1" wipe="${2:-0}"
   local logf="$LOG_DIR/server_${policy}.log"
-  rm -rf "$HICACHE_DIR"; mkdir -p "$HICACHE_DIR"
-  SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$HICACHE_DIR" \
+  local hdir="${HICACHE_DIR}_${policy}"   # per-policy L3 dir
+  if [ "$wipe" = "1" ]; then rm -rf "$hdir"; fi
+  mkdir -p "$hdir"
+  SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$hdir" \
+  SGLANG_HICACHE_FILE_BACKEND_GET_DELAY_MS="$GET_DELAY_MS" \
   python -m sglang.launch_server \
     --model-path "$MODEL" \
     --host 127.0.0.1 --port "$PORT" \
@@ -30,7 +35,7 @@ start_server () {
     --hicache-storage-prefetch-policy "$policy" \
     --hicache-storage-backend-extra-config '{"prefetch_threshold":32,"cost_aware_gamma":1.0}' \
     --max-running-requests 32 \
-    --log-level info \
+    --log-level debug \
     > "$logf" 2>&1 &
   echo $!
 }
@@ -51,6 +56,7 @@ run_bench () {
     --dataset-path "$DATASET_PATH" \
     --num-prompts "$NUM_PROMPTS" \
     --request-rate "$REQ_RATE" \
+    --seed "$SEED" \
     --output-file "$outfile" \
     > "$LOG_DIR/bench_${policy}_${tag}.log" 2>&1
 }
@@ -63,17 +69,21 @@ stop_server () {
 }
 
 POLICIES="${POLICIES:-best_effort wait_complete timeout cost_aware}"
-echo "=== BENCH3 START $(date) model=$MODEL dataset=sharegpt n=$NUM_PROMPTS rate=$REQ_RATE ==="
+rm -f "$RESULT_DIR"/*.json    # avoid JSONL append pollution
+echo "=== BENCH3 START $(date) model=$MODEL dataset=sharegpt n=$NUM_PROMPTS rate=$REQ_RATE delay=${GET_DELAY_MS}ms ==="
 for pol in $POLICIES; do
   echo "########## POLICY=$pol ##########"
-  PID=$(start_server "$pol")
+  PID=$(start_server "$pol" 1)
   if ! wait_ready; then echo "[$pol] server failed (warm)"; tail -n 30 "$LOG_DIR/server_${pol}.log"; stop_server "$PID"; continue; fi
   run_bench "$pol" warm "$RESULT_DIR/${pol}_warm.json"
   stop_server "$PID"
+  echo "[$pol] L3_files_after_warm: $(ls ${HICACHE_DIR}_${pol} 2>/dev/null | wc -l)"
   sleep 3
-  PID=$(start_server "$pol")
+  PID=$(start_server "$pol" 0)
   if ! wait_ready; then echo "[$pol] server failed (measure)"; tail -n 30 "$LOG_DIR/server_${pol}.log"; stop_server "$PID"; continue; fi
+  echo "[$pol] L3_files_at_measure_start: $(ls ${HICACHE_DIR}_${pol} 2>/dev/null | wc -l)"
   run_bench "$pol" measure "$RESULT_DIR/${pol}_measure.json"
+  echo "[$pol] prefetch_nonzero_tokens: $(grep -oE 'completed with [1-9][0-9]* tokens' "$LOG_DIR/server_${pol}.log" | wc -l)"
   grep -iE "prefetch|storage_hit|revok|terminate" "$LOG_DIR/server_${pol}.log" | tail -n 60 > "$LOG_DIR/prefetch_${pol}.log"
   stop_server "$PID"
   sleep 3
