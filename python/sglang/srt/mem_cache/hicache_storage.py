@@ -398,6 +398,18 @@ class HiCacheFile(HiCacheStorage):
         except (TypeError, ValueError):
             self._get_delay_s = 0.0
 
+        # Real transfer instrumentation: measure actual page_get bytes/time to
+        # derive the observed L3 bandwidth of the underlying medium (e.g. tmpfs
+        # /dev/shm vs disk /tmp), with zero artificial sleep. Enabled by env
+        # SGLANG_HICACHE_FILE_BACKEND_PROFILE=1.
+        self._profile_io = os.environ.get(
+            "SGLANG_HICACHE_FILE_BACKEND_PROFILE", "0"
+        ) not in ("0", "", "false", "False")
+        self._io_bytes_total = 0
+        self._io_time_total = 0.0
+        self._io_pages_total = 0
+        self._io_log_every = 200  # log observed bandwidth every N pages
+
         # Metadata cache positive lookup toggle & TTL
         enable_cache_raw = None
         if storage_config.extra_config:
@@ -499,12 +511,33 @@ class HiCacheFile(HiCacheStorage):
     ) -> List[torch.Tensor | None]:
         if self._get_delay_s > 0:
             time.sleep(self._get_delay_s * len(keys))
-        return [
-            self.get(key, target_location)
-            for key, target_location in zip(
-                keys, target_locations or [None] * len(keys)
+        if not self._profile_io:
+            return [
+                self.get(key, target_location)
+                for key, target_location in zip(
+                    keys, target_locations or [None] * len(keys)
+                )
+            ]
+        # Instrumented path: measure real transfer time + bytes (zero sleep).
+        locs = target_locations or [None] * len(keys)
+        t0 = time.perf_counter()
+        results = [self.get(key, loc) for key, loc in zip(keys, locs)]
+        dt = time.perf_counter() - t0
+        nbytes = 0
+        for loc in locs:
+            if loc is not None:
+                nbytes += loc.numel() * loc.element_size()
+        self._io_bytes_total += nbytes
+        self._io_time_total += dt
+        self._io_pages_total += len(keys)
+        if self._io_pages_total % self._io_log_every < len(keys) and self._io_time_total > 0:
+            bw = self._io_bytes_total / self._io_time_total / (1024 ** 3)
+            logger.info(
+                f"HiCacheFile observed L3 read bandwidth: {bw:.2f} GB/s "
+                f"({self._io_pages_total} pages, "
+                f"{self._io_bytes_total/1024/1024:.0f} MB in {self._io_time_total:.2f}s)"
             )
-        ]
+        return results
 
     def set(
         self,
