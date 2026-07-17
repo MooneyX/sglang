@@ -9,7 +9,8 @@ MODEL = "/root/.cache/huggingface/qwen14b"
 DELAYS = [int(x) for x in os.environ.get("SCAN_DELAYS", "0,2,4").split(",")]
 RATES  = [int(x) for x in os.environ.get("SCAN_RATES", "4,8,12").split(",")]
 POLICIES = os.environ.get("SCAN_POLICIES", "best_effort,wait_complete,timeout,cost_aware").split(",")
-NGPU = int(os.environ.get("SCAN_NGPU", "8"))
+NGPU = int(os.environ.get("SCAN_NGPU", "4"))   # 4-way: avoid concurrent pinned-memory (cudaHostRegister) contention
+HICACHE_RATIO = os.environ.get("SCAN_HICACHE_RATIO", "1.2")  # smaller host pool -> less pinned mem per server
 
 # Compact shared-prefix load to keep each task short.
 GSP_GROUPS, GSP_PER, SYS, QLEN, OUT = 6, 8, 4096, 128, 32
@@ -30,7 +31,7 @@ def start_server(gpu, port, hdir, delay, policy, logf):
            f"SGLANG_HICACHE_FILE_BACKEND_GET_DELAY_MS={delay} "
            f"python -m sglang.launch_server --model-path {MODEL} "
            f"--host 127.0.0.1 --port {port} --tp 1 --mem-fraction-static 0.75 "
-           f"--enable-hierarchical-cache --hicache-ratio 1.5 --hicache-storage-backend file "
+           f"--enable-hierarchical-cache --hicache-ratio {HICACHE_RATIO} --hicache-storage-backend file "
            f"--hicache-storage-prefetch-policy {policy} "
            f"--hicache-storage-backend-extra-config '{{\"prefetch_threshold\":32,\"cost_aware_gamma\":1.0}}' "
            f"--max-running-requests 32 --log-level info > {logf} 2>&1 &")
@@ -59,6 +60,17 @@ def bench(port, rate, outfile, logf, timeout):
     except subprocess.TimeoutExpired:
         return -1
 
+def start_and_wait(gpu, port, hdir, delay, policy, slog, tries=2):
+    # Retry start: concurrent pinned-memory registration can transiently fail.
+    for attempt in range(tries):
+        stop_server(port)
+        start_server(gpu, port, hdir, delay, policy, slog)
+        if wait_ready(port):
+            return True
+        # startup failed (e.g. cudaHostRegister). back off staggered by gpu id, retry.
+        time.sleep(5 + gpu * 3)
+    return False
+
 def task(gpu, delay, rate, policy):
     port = 31000 + gpu
     tag = f"{policy}_d{delay}_r{rate}"
@@ -69,16 +81,14 @@ def task(gpu, delay, rate, policy):
     slog = f"{LOG}/server_{tag}.log"
 
     # warm: delay=0 to fill L3 fast (write path unaffected by read delay)
-    start_server(gpu, port, hdir, 0, policy, slog)
-    if not wait_ready(port):
+    if not start_and_wait(gpu, port, hdir, 0, policy, slog):
         stop_server(port); return (tag, "WARM_START_FAIL")
     bench(port, rate, warm_out, f"{LOG}/bench_{tag}_warm.log", WARM_TIMEOUT)
     stop_server(port)
     nfiles = len(os.listdir(hdir)) if os.path.isdir(hdir) else 0
 
     # measure: target delay, KEEP L3 (no wipe)
-    start_server(gpu, port, hdir, delay, policy, slog)
-    if not wait_ready(port):
+    if not start_and_wait(gpu, port, hdir, delay, policy, slog):
         stop_server(port); return (tag, f"MEASURE_START_FAIL L3={nfiles}")
     rc = bench(port, rate, meas_out, f"{LOG}/bench_{tag}_measure.log", MEASURE_TIMEOUT)
     nz = int(subprocess.run(
@@ -89,6 +99,7 @@ def task(gpu, delay, rate, policy):
     return (tag, f"{status} L3={nfiles} nz={nz}")
 
 def worker(gpu, task_q, results, lock):
+    time.sleep(gpu * 20)  # stagger first-server startup to avoid pinned-mem registration spike
     while True:
         try:
             d, r, p = task_q.get_nowait()
