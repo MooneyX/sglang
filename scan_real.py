@@ -46,7 +46,7 @@ def start_server(gpu, port, hdir, policy, logf):
     # background prefetch to bring KV back from L3 -> this is what actually exercises
     # the prefetch-stop policies (nz>0).
     if HICACHE_SIZE_GB > 0:
-        cap = f"--hicache-size {HICACHE_SIZE_GB}"
+        cap = f"--hicache-size {int(HICACHE_SIZE_GB)}"
     else:
         cap = f"--hicache-ratio {HICACHE_RATIO}"
     cmd = (f"CUDA_VISIBLE_DEVICES={gpu} "
