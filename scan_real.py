@@ -19,6 +19,7 @@ RATES  = [int(x) for x in os.environ.get("SCAN_RATES", "4,8,12").split(",")]
 POLICIES = os.environ.get("SCAN_POLICIES", "best_effort,wait_complete,timeout,cost_aware").split(",")
 NGPU = int(os.environ.get("SCAN_NGPU", "4"))
 HICACHE_RATIO = os.environ.get("SCAN_HICACHE_RATIO", "1.2")
+HICACHE_SIZE_GB = float(os.environ.get("SCAN_HICACHE_SIZE_GB", "0"))  # >0 overrides ratio; small -> force L3 eviction
 MEM_FRAC = os.environ.get("SCAN_MEM_FRAC", "0.85")   # 32B weights ~62GB; leave room for KV
 
 # Longer shared prefix -> heavier prefill (bigger t_save). Keep prompt count modest
@@ -40,12 +41,20 @@ def sh(cmd):
 
 def start_server(gpu, port, hdir, policy, logf):
     # NO GET_DELAY -- real medium speed only. PROFILE=1 to log observed bandwidth.
+    # hicache-size (GB, absolute) overrides ratio when >0. A SMALL host pool forces
+    # prefixes to be evicted from L2 down to L3-only, so the request must rely on the
+    # background prefetch to bring KV back from L3 -> this is what actually exercises
+    # the prefetch-stop policies (nz>0).
+    if HICACHE_SIZE_GB > 0:
+        cap = f"--hicache-size {HICACHE_SIZE_GB}"
+    else:
+        cap = f"--hicache-ratio {HICACHE_RATIO}"
     cmd = (f"CUDA_VISIBLE_DEVICES={gpu} "
            f"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR={hdir} "
            f"SGLANG_HICACHE_FILE_BACKEND_PROFILE=1 "
            f"python -m sglang.launch_server --model-path {MODEL} "
            f"--host 127.0.0.1 --port {port} --tp 1 --mem-fraction-static {MEM_FRAC} "
-           f"--enable-hierarchical-cache --hicache-ratio {HICACHE_RATIO} --hicache-storage-backend file "
+           f"--enable-hierarchical-cache {cap} --hicache-storage-backend file "
            f"--hicache-storage-prefetch-policy {policy} "
            f"--hicache-storage-backend-extra-config '{{\"prefetch_threshold\":32,\"cost_aware_gamma\":1.0}}' "
            f"--max-running-requests 32 --log-level info > {logf} 2>&1 &")
