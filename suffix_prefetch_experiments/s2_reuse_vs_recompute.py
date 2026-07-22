@@ -76,28 +76,28 @@ def out_logprobs(r):
 
 
 def gen_ids(ids):
-    # 直接用 input_ids 传入，绕开分词/模板差异，保证两次前缀 token 完全一致
+    # 直接用 input_ids 传入，绕开分词/模板差异，保证两次前缀 token 完全一致。
+    # 不设 logprob_start_len=0（那会强制从位置0重算 logprob、抑制前缀缓存复用）；
+    # 只取输出 token 的 logprob 做等价对比即可。
     return post(
         "/generate",
         {
             "input_ids": ids,
             "sampling_params": {"max_new_tokens": 24, "temperature": 0},
             "return_logprob": True,
-            "logprob_start_len": 0,
         },
     )
 
 
-# 构造确定性 token 序列：共享前缀 SHARED_IDS（384 token，6×page64）+ 不同后缀。
-# 用词表内安全 id（qwen 词表很大，用小范围可打印 token id 拼接）。
+# 构造确定性 token 序列：共享前缀 SHARED_IDS（384 token，6×page64）+ 问题后缀。
 import itertools
 
-base_cycle = [785, 3974, 9887, 21296, 5867, 1052, 1207, 8412]  # 任意固定 token id
+base_cycle = [785, 3974, 9887, 21296, 5867, 1052, 1207, 8412]
 SHARED_IDS = list(itertools.islice(itertools.cycle(base_cycle), 384))
-Q_IDS = [40, 1128, 279, 1376, 4522, 30]      # 问题后缀
-SEED_TAIL = [7985, 264, 2155, 9789, 13]       # 种子用的不同后缀
+Q_IDS = [40, 1128, 279, 1376, 4522, 30]
 PROMPT_IDS = SHARED_IDS + Q_IDS
 
+# 路径A：flush 清空缓存 → 前缀完全重算（cached 应=0）
 print("=== 路径A: flush 缓存后，前缀完全重算 ===")
 flush()
 rA = gen_ids(PROMPT_IDS)
@@ -106,11 +106,11 @@ lpA = out_logprobs(rA)
 print("A output tokens:", tokA[:12], "...")
 print("A prompt_tokens:", rA["meta_info"]["prompt_tokens"], "cached:", rA["meta_info"].get("cached_tokens"))
 
-print("=== 路径B: 先种入 SHARED 前缀缓存，再复用 ===")
-flush()
-_seed = gen_ids(SHARED_IDS + SEED_TAIL)  # 种子请求：把 SHARED 前缀写入 radix
+# 路径B：预热同一 PROMPT（写入缓存）→ 再发相同请求，前缀被复用（cached 应>0）
+print("=== 路径B: 预热后前缀命中缓存复用 ===")
+_warm = gen_ids(PROMPT_IDS)   # 预热：把整个前缀写入 radix
 time.sleep(1.0)
-rB = gen_ids(PROMPT_IDS)                  # SHARED 部分应命中缓存
+rB = gen_ids(PROMPT_IDS)      # 复用：SHARED+Q 前缀命中缓存
 tokB = [e[1] for e in rB["meta_info"]["output_token_logprobs"]]
 lpB = out_logprobs(rB)
 print("B output tokens:", tokB[:12], "...")
