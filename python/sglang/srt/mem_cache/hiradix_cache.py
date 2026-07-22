@@ -1478,6 +1478,16 @@ class HiRadixCache(RadixCache):
         )
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
+        # SuffixPrefetch (stage 2): feed measured L3->host transfer throughput to
+        # the split-point estimator so tau (seconds/token) gets calibrated online.
+        op_start = getattr(operation, "start_time", None)
+        if completed_tokens > 0 and op_start is not None:
+            elapsed = time.monotonic() - op_start
+            if elapsed > 0:
+                self.suffix_split_estimator.record_transfer_rate(
+                    completed_tokens, elapsed
+                )
+
         min_completed_tokens = completed_tokens
         # Synchronize workers before mutating host cache tree state.
         completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)

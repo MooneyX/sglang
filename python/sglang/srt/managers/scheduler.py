@@ -1535,7 +1535,13 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
+                _sp_est = self._suffix_prefetch_estimator()
+                if _sp_est is not None and batch.forward_mode.is_extend():
+                    _sp_t0 = time.monotonic()
+                    result = self.run_batch(batch)
+                    self._record_suffix_prefetch_prefill(_sp_est, batch, _sp_t0)
+                else:
+                    result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -3184,6 +3190,46 @@ class Scheduler(
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
+
+    def _suffix_prefetch_estimator(self):
+        """Return the SuffixPrefetch split-point estimator if the policy is
+        active, else None. Fully defensive: any missing attribute -> None, so
+        this never perturbs the scheduling loop."""
+        tree_cache = getattr(self, "tree_cache", None)
+        if tree_cache is None:
+            return None
+        if getattr(tree_cache, "prefetch_stop_policy", None) != "suffix_prefetch":
+            return None
+        # Wall-clock timing is only trustworthy when overlap scheduling is off
+        # (overlap launches the batch asynchronously and returns early).
+        if getattr(self, "enable_overlap", False):
+            return None
+        return getattr(tree_cache, "suffix_split_estimator", None)
+
+    def _record_suffix_prefetch_prefill(self, estimator, batch, t0: float) -> None:
+        """Feed one measured prefill (extend) step to the split estimator.
+
+        Uses batch-aggregate step_tokens (extend_num_tokens) and the mean cached
+        prefix length as start_pos. Wall-clock based; sufficient to fit the
+        POSITION-relative recompute-cost slope alpha. Never raises."""
+        try:
+            step_seconds = time.monotonic() - t0
+            step_tokens = int(getattr(batch, "extend_num_tokens", 0) or 0)
+            if step_tokens <= 0 or step_seconds <= 0:
+                return
+            prefix_lens = getattr(batch, "prefix_lens", None)
+            if prefix_lens:
+                start_pos = int(sum(prefix_lens) / len(prefix_lens))
+            else:
+                start_pos = 0
+            estimator.record_prefill_step(
+                step_gpu_time=step_seconds,
+                step_tokens=step_tokens,
+                start_pos=start_pos,
+            )
+        except Exception:
+            # Calibration must never break scheduling.
+            pass
 
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
