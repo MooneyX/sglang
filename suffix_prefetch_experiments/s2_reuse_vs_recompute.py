@@ -75,31 +75,42 @@ def out_logprobs(r):
     return [e[0] for e in r["meta_info"].get("output_token_logprobs", []) if isinstance(e, (list, tuple))]
 
 
-# 用足够长的共享前缀（>=数百 token，跨多个 page），后接不同问题。
-# radix cache 复用的是"已提交的前缀"，所以让 SHARED 作为公共前缀，
-# 两个请求 SHARED+Q1 / SHARED+Q2 的公共部分 SHARED 会被第二个请求命中复用。
-SHARED = (
-    "In the field of machine learning, attention mechanisms have become "
-    + ("a fundamental building block for modern neural architectures. " * 30)
-)
-Q = " Question: summarize the key idea above in exactly one clear sentence. Answer:"
-PROMPT = SHARED + Q
+def gen_ids(ids):
+    # 直接用 input_ids 传入，绕开分词/模板差异，保证两次前缀 token 完全一致
+    return post(
+        "/generate",
+        {
+            "input_ids": ids,
+            "sampling_params": {"max_new_tokens": 24, "temperature": 0},
+            "return_logprob": True,
+            "logprob_start_len": 0,
+        },
+    )
+
+
+# 构造确定性 token 序列：共享前缀 SHARED_IDS（384 token，6×page64）+ 不同后缀。
+# 用词表内安全 id（qwen 词表很大，用小范围可打印 token id 拼接）。
+import itertools
+
+base_cycle = [785, 3974, 9887, 21296, 5867, 1052, 1207, 8412]  # 任意固定 token id
+SHARED_IDS = list(itertools.islice(itertools.cycle(base_cycle), 384))
+Q_IDS = [40, 1128, 279, 1376, 4522, 30]      # 问题后缀
+SEED_TAIL = [7985, 264, 2155, 9789, 13]       # 种子用的不同后缀
+PROMPT_IDS = SHARED_IDS + Q_IDS
 
 print("=== 路径A: flush 缓存后，前缀完全重算 ===")
 flush()
-rA = gen(PROMPT)
+rA = gen_ids(PROMPT_IDS)
 tokA = [e[1] for e in rA["meta_info"]["output_token_logprobs"]]
 lpA = out_logprobs(rA)
 print("A output tokens:", tokA[:12], "...")
 print("A prompt_tokens:", rA["meta_info"]["prompt_tokens"], "cached:", rA["meta_info"].get("cached_tokens"))
 
-# 路径B: 先用一个"种子"请求把 SHARED 前缀写入 radix cache（不同后缀），
-# 再发 PROMPT，使其 SHARED 部分命中缓存被复用。
-print("=== 路径B: 先种入前缀缓存，再复用 ===")
+print("=== 路径B: 先种入 SHARED 前缀缓存，再复用 ===")
 flush()
-_seed = gen(SHARED + " Seed different tail to commit the shared prefix into cache.")
+_seed = gen_ids(SHARED_IDS + SEED_TAIL)  # 种子请求：把 SHARED 前缀写入 radix
 time.sleep(1.0)
-rB = gen(PROMPT)
+rB = gen_ids(PROMPT_IDS)                  # SHARED 部分应命中缓存
 tokB = [e[1] for e in rB["meta_info"]["output_token_logprobs"]]
 lpB = out_logprobs(rB)
 print("B output tokens:", tokB[:12], "...")
