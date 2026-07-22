@@ -55,6 +55,10 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     TreeNode,
 )
+from sglang.srt.mem_cache.suffix_prefetch import (
+    SuffixSplitConfig,
+    SuffixSplitEstimator,
+)
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     split_node_hash_value,
@@ -126,6 +130,17 @@ class HiRadixCache(RadixCache):
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+
+        # SuffixPrefetch (stage 1): online estimator of the recompute/prefetch
+        # split point x*. Calibrated from measured prefill steps + transfer rate.
+        # Only ACTIVE (consulted) when prefetch_stop_policy == "suffix_prefetch";
+        # in stage 1 it merely computes and logs x* (no behavior change yet).
+        self.suffix_split_estimator = SuffixSplitEstimator(
+            SuffixSplitConfig(
+                gamma=float(extra_config.get("suffix_prefetch_gamma", 1.0)),
+                ema_alpha=float(extra_config.get("suffix_prefetch_ema_alpha", 0.1)),
+            )
+        )
 
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, DSATokenToKVPool):
@@ -354,7 +369,7 @@ class HiRadixCache(RadixCache):
         """
         # Validate inputs first (no side effects).
         if hicache_storage_prefetch_policy is not None:
-            allowed = ["best_effort", "wait_complete", "timeout"]
+            allowed = ["best_effort", "wait_complete", "timeout", "suffix_prefetch"]
             if hicache_storage_prefetch_policy not in allowed:
                 return (
                     False,
@@ -1411,6 +1426,11 @@ class HiRadixCache(RadixCache):
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
             can_terminate = completed or self.is_prefetch_timeout(operation)
+        elif self.prefetch_stop_policy == "suffix_prefetch":
+            # Stage 1: no dedicated stopping behavior yet. Fall back to
+            # best-effort semantics (terminate as soon as scheduling is ready),
+            # so enabling the policy is safe while x* is only being observed.
+            can_terminate = True
         else:
             # unknown prefetch stop policy, just return True
             return True
@@ -1599,6 +1619,21 @@ class HiRadixCache(RadixCache):
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+
+        # SuffixPrefetch (stage 1): compute and log the recompute/prefetch split
+        # point x* for observability only. No behavior change yet -- the full
+        # prefetch still fetches the whole prefix [0, N). Stage 2/3 will use x*
+        # to fetch only the suffix [x*, N) and recompute [0, x*).
+        if self.prefetch_stop_policy == "suffix_prefetch":
+            n = len(prefetch_key)
+            x_star = self.suffix_split_estimator.compute_split_point(
+                prefix_len=n, page_size=self.page_size
+            )
+            logger.debug(
+                "[suffix_prefetch] req=%s %s",
+                req_id,
+                self.suffix_split_estimator.describe(n, self.page_size),
+            )
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
