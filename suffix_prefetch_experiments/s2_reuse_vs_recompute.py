@@ -75,12 +75,17 @@ def out_logprobs(r):
     return [e[0] for e in r["meta_info"].get("output_token_logprobs", []) if isinstance(e, (list, tuple))]
 
 
-PREFIX = "In the field of machine learning, attention mechanisms have become " + (
-    "fundamental building blocks for modern architectures. " * 20
+# 用足够长的共享前缀（>=数百 token，跨多个 page），后接不同问题。
+# radix cache 复用的是"已提交的前缀"，所以让 SHARED 作为公共前缀，
+# 两个请求 SHARED+Q1 / SHARED+Q2 的公共部分 SHARED 会被第二个请求命中复用。
+SHARED = (
+    "In the field of machine learning, attention mechanisms have become "
+    + ("a fundamental building block for modern neural architectures. " * 30)
 )
-PROMPT = PREFIX + " Summarize the key idea in one sentence:"
+Q = " Question: summarize the key idea above in exactly one clear sentence. Answer:"
+PROMPT = SHARED + Q
 
-print("=== 路径A: flush 后重算前缀 ===")
+print("=== 路径A: flush 缓存后，前缀完全重算 ===")
 flush()
 rA = gen(PROMPT)
 tokA = [e[1] for e in rA["meta_info"]["output_token_logprobs"]]
@@ -88,7 +93,12 @@ lpA = out_logprobs(rA)
 print("A output tokens:", tokA[:12], "...")
 print("A prompt_tokens:", rA["meta_info"]["prompt_tokens"], "cached:", rA["meta_info"].get("cached_tokens"))
 
-print("=== 路径B: 立即重发, 前缀复用缓存 ===")
+# 路径B: 先用一个"种子"请求把 SHARED 前缀写入 radix cache（不同后缀），
+# 再发 PROMPT，使其 SHARED 部分命中缓存被复用。
+print("=== 路径B: 先种入前缀缓存，再复用 ===")
+flush()
+_seed = gen(SHARED + " Seed different tail to commit the shared prefix into cache.")
+time.sleep(1.0)
 rB = gen(PROMPT)
 tokB = [e[1] for e in rB["meta_info"]["output_token_logprobs"]]
 lpB = out_logprobs(rB)
