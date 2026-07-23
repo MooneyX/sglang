@@ -186,6 +186,9 @@ class HiRadixCache(RadixCache):
         # value: the freshly inserted suffix TreeNode. It is re-anchored under the
         # recomputed x* node once pass ① caches [matched_len, x*).
         self.pending_suffix_reanchor: dict[str, TreeNode] = {}
+        # SuffixPrefetch online-fit: prefetch issue timestamps (req_id -> monotonic
+        # seconds), used to estimate real per-token L3 fetch cost tau on completion.
+        self._suffix_prefetch_issue_time: dict[str, float] = {}
         self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
@@ -724,6 +727,7 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.pending_suffix_reanchor.clear()
+        self._suffix_prefetch_issue_time.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -1477,6 +1481,18 @@ class HiRadixCache(RadixCache):
         )
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
+        # SuffixPrefetch online-fit: estimate real per-token L3 fetch cost tau from
+        # this completed prefetch (completed_tokens over the elapsed wall time).
+        issue_t = self._suffix_prefetch_issue_time.pop(req_id, None)
+        cost_model = getattr(self, "suffix_prefetch_cost_model", None)
+        if (
+            issue_t is not None
+            and cost_model is not None
+            and getattr(cost_model, "online_fit", False)
+            and completed_tokens > 0
+        ):
+            cost_model.observe_prefetch(completed_tokens, time.monotonic() - issue_t)
+
         min_completed_tokens = completed_tokens
         # Synchronize workers before mutating host cache tree state.
         completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
@@ -1714,6 +1730,12 @@ class HiRadixCache(RadixCache):
             host_indices,
             operation,
         )
+        # SuffixPrefetch online-fit: record prefetch issue time to later estimate
+        # the real per-token L3 fetch cost tau on completion.
+        if getattr(self, "suffix_prefetch_cost_model", None) is not None and getattr(
+            self.suffix_prefetch_cost_model, "online_fit", False
+        ):
+            self._suffix_prefetch_issue_time[req_id] = time.monotonic()
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
     def _insert_helper_host(
@@ -1911,6 +1933,7 @@ class HiRadixCache(RadixCache):
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self._suffix_prefetch_issue_time.pop(rid, None)
         # SuffixPrefetch: release a pending (not yet re-anchored) suffix node so its
         # protected host memory can be reclaimed.
         orphan = self.pending_suffix_reanchor.pop(rid, None)

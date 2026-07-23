@@ -507,6 +507,32 @@ class SchedulerMetricsReporter:
         self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
 
+    def _maybe_observe_recompute(self, batch, prefill_stats, gap_latency):
+        """SuffixPrefetch online-fit: feed a recompute-cost sample to the cost model.
+
+        Only samples clean single-request extend batches (num_new_seqs==1), where
+        gap_latency approximates this chunk's forward time. The chunk start position
+        (len(prefix_indices)) is i; per-token cost c = gap_latency / new_tokens.
+        Guarded on the suffix policy + online_fit; any error is swallowed (this is
+        a best-effort optimization loop, never correctness-critical).
+        """
+        try:
+            tree_cache = getattr(self.scheduler, "tree_cache", None)
+            cost_model = getattr(tree_cache, "suffix_prefetch_cost_model", None)
+            if cost_model is None or not getattr(cost_model, "online_fit", False):
+                return
+            if prefill_stats.num_new_seqs != 1:
+                return
+            new_tokens = prefill_stats.log_input_tokens
+            if new_tokens <= 0 or gap_latency <= 0.0:
+                return
+            if batch is None or not getattr(batch, "reqs", None):
+                return
+            start_pos = len(batch.reqs[0].prefix_indices)
+            cost_model.observe_recompute_chunk(start_pos, new_tokens, gap_latency)
+        except Exception:
+            pass
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
@@ -526,6 +552,15 @@ class SchedulerMetricsReporter:
         self.last_input_throughput = (
             prefill_stats.log_input_tokens / gap_latency if gap_latency > 0 else 0.0
         )
+
+        # SuffixPrefetch online-fit: feed this prefill chunk as a recompute-cost
+        # sample c(i)=elapsed/num_tokens at position i (chunk start). Strictly gated
+        # to single-request extend batches so gap_latency ≈ this chunk's forward
+        # time (no batching contamination). The cost model's least-squares handles
+        # residual noise via decay + a min-sample threshold. NOTE: this hook lives
+        # on the stats-logging path, so online-fit for alpha/beta requires stats
+        # logging to be active (e.g. --log-level debug); tau fitting is independent.
+        self._maybe_observe_recompute(batch, prefill_stats, gap_latency)
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
