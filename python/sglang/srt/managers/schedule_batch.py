@@ -864,6 +864,11 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # SuffixPrefetch: the split point x* (absolute token position). Under the
+        # "suffix" prefetch policy, [matched_len, x*) is GPU-recomputed (first
+        # chunk stops here), [x*, N) is reused from the prefetched suffix.
+        # 0 means "not set / not applicable".
+        self.suffix_prefetch_x_star: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is

@@ -955,6 +955,16 @@ class PrefillAdder:
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
 
+            # ---- SuffixPrefetch (改动C): force first prefill chunk to stop at x* ----
+            # Under the "suffix" policy, [prefix_len, x*) is GPU-recomputed as the
+            # first chunk; the prefetched suffix [x*, N) is reused in a later pass.
+            # We cap this iteration's work so the chunk boundary lands exactly on x*,
+            # then let it flow through the chunked-prefill branch below.
+            suffix_first_chunk_len = 0
+            x_star = getattr(req, "suffix_prefetch_x_star", 0)
+            if x_star > prefix_len:
+                suffix_first_chunk_len = x_star - prefix_len
+
             if (
                 self.rem_chunk_tokens is None
                 and len(self.can_run_list) != 0
@@ -975,8 +985,12 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif suffix_first_chunk_len <= 0 and (
+                self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens
+            ):
                 # Non-chunked prefill — the whole sequence is committed this iter.
+                # (Skipped when SuffixPrefetch wants to split at x*: fall through to
+                #  the chunked branch so the first chunk stops exactly at x*.)
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
@@ -994,7 +1008,16 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                if self.rem_chunk_tokens is None:
+                    # chunked prefill disabled, but SuffixPrefetch still wants to
+                    # split at x*: use the suffix cap as this chunk's budget.
+                    trunc_len = suffix_first_chunk_len
+                else:
+                    trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+
+                # ---- SuffixPrefetch (改动C): cap first chunk to end at x* ----
+                if suffix_first_chunk_len > 0:
+                    trunc_len = min(trunc_len, suffix_first_chunk_len)
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER

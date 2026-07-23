@@ -2317,6 +2317,10 @@ class Scheduler(
                                 skipped[i : i + page_size], last_hash
                             )
                         prefetch_start = x_star
+                        # Record x* so the scheduler can stop the first prefill
+                        # chunk here (recompute [matched_len, x*)) and reuse the
+                        # prefetched suffix [x*, match_end) in the next pass.
+                        req.suffix_prefetch_x_star = x_star
 
                 new_input_tokens = req.full_untruncated_fill_ids[
                     prefetch_start:match_end
