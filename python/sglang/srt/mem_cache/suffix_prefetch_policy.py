@@ -16,8 +16,11 @@ x* 必须约束在 [h, N)：h = 已在 device+host 命中的长度（matched_len
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -48,7 +51,8 @@ class SuffixPrefetchCostModel:
 
     # ---- 在线统计的内部状态（不参与 __init__ 的位置参数） ----
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    _n_recompute: float = 0.0         # 加权样本数（重算 chunk）
+    _n_recompute: float = 0.0         # 加权样本数（重算 chunk，随遗忘因子衰减）
+    _n_recompute_raw: int = 0         # 真实累计样本数（不衰减，仅用于阈值判断）
     _sw: float = 0.0                  # Σw
     _swi: float = 0.0                 # Σ w*i
     _swc: float = 0.0                 # Σ w*c
@@ -84,6 +88,15 @@ class SuffixPrefetchCostModel:
                 g = self.tau_ema_gamma
                 self._tau_ema = (1.0 - g) * self._tau_ema + g * tau_obs
             self._maybe_apply_locked()
+        logger.debug(
+            "[SuffixPrefetch][obs-tau] tokens=%d elapsed_ms=%.1f "
+            "tau_obs_ms/tok=%.4f tau_ema_ms/tok=%.4f n_prefetch=%d",
+            completed_tokens,
+            elapsed_s * 1e3,
+            tau_obs * 1e3,
+            self._tau_ema * 1e3,
+            self._n_prefetch,
+        )
 
     def observe_recompute_chunk(
         self, start_pos: int, num_tokens: int, elapsed_s: float
@@ -107,7 +120,22 @@ class SuffixPrefetchCostModel:
             self._swii = self._swii * d + i_mid * i_mid
             self._swic = self._swic * d + i_mid * c_obs
             self._n_recompute = self._n_recompute * d + 1.0
+            self._n_recompute_raw += 1
             self._maybe_apply_locked()
+        logger.debug(
+            "[SuffixPrefetch][obs-recompute] i=%.0f tokens=%d elapsed_ms=%.1f "
+            "c_obs_ms/tok=%.4f tau_ms/tok=%.4f alpha=%.3e beta_ms/tok=%.4f "
+            "n_raw=%d n_weighted=%.1f",
+            i_mid,
+            num_tokens,
+            elapsed_s * 1e3,
+            c_obs * 1e3,
+            self.tau * 1e3,
+            self.alpha,
+            self.beta * 1e3,
+            self._n_recompute_raw,
+            self._n_recompute,
+        )
 
     def _maybe_apply_locked(self) -> None:
         """在持锁状态下，根据当前统计尝试更新 alpha/beta/tau。"""
@@ -115,8 +143,9 @@ class SuffixPrefetchCostModel:
         if self._n_prefetch >= self.min_prefetch_samples and self._tau_ema > 0.0:
             self.tau = self._tau_ema
 
-        # 拟合 alpha/beta（需要足够样本且 i 有方差）
-        if self._n_recompute >= self.min_recompute_samples and self._sw > 0.0:
+        # 拟合 alpha/beta（用真实累计样本数判阈值，避免遗忘衰减后的 _n_recompute
+        # 永远差一点到阈值导致 alpha/beta 从不更新；拟合本身仍用衰减统计量）
+        if self._n_recompute_raw >= self.min_recompute_samples and self._sw > 0.0:
             mean_i = self._swi / self._sw
             mean_c = self._swc / self._sw
             var_i = self._swii / self._sw - mean_i * mean_i
@@ -149,6 +178,11 @@ class SuffixPrefetchCostModel:
             - x* >= n（c 全程 < tau，小模型/快重算）→ 返回 n（全重算，不预取）。
         """
         if not self.enabled or n <= h:
+            logger.debug(
+                "[SuffixPrefetch][x*] h=%d N=%d -> x*=%d (disabled/empty) "
+                "alpha=%.3e beta_ms=%.4f tau_ms=%.4f",
+                h, n, h, self.alpha, self.beta * 1e3, self.tau * 1e3,
+            )
             return h
 
         x_star_f = (self.tau - self.beta) / self.alpha
@@ -159,6 +193,26 @@ class SuffixPrefetchCostModel:
             x_star -= x_star % page_size
             if x_star < h:
                 x_star = h
+        # 决策日志：记录每次 x* 计算的输入(h,N)、原始解、clamp 后结果、当前参数，
+        # 以及三段划分 [h,x*)重算 / [x*,N)预取，便于分析 x* 漂移与最优策略的偏差。
+        if x_star <= h:
+            regime = "ALL_PREFETCH"      # c 全程 > tau
+        elif x_star >= n:
+            regime = "ALL_RECOMPUTE"     # c 全程 < tau
+        else:
+            regime = "SPLIT"             # 甜点：前段重算+后段预取
+        logger.debug(
+            "[SuffixPrefetch][x*] h=%d N=%d x*_raw=%.1f x*=%d regime=%s | "
+            "recompute[%d,%d)=%d tok, prefetch[%d,%d)=%d tok | "
+            "alpha=%.3e beta_ms/tok=%.4f tau_ms/tok=%.4f "
+            "c(h)_ms=%.4f c(N)_ms=%.4f",
+            h, n, x_star_f, x_star, regime,
+            h, x_star, max(0, x_star - h),
+            x_star, n, max(0, n - x_star),
+            self.alpha, self.beta * 1e3, self.tau * 1e3,
+            (self.alpha * h + self.beta) * 1e3,
+            (self.alpha * n + self.beta) * 1e3,
+        )
         return x_star
 
     @classmethod
