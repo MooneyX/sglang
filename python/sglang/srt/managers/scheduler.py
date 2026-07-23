@@ -227,6 +227,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -2287,7 +2288,39 @@ class Scheduler(
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )
-                new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
+                # ---- SuffixPrefetch: only prefetch the suffix [x*, match_end) ----
+                # [matched_len, x*) is left for GPU recompute (cheaper than prefetch
+                # when c(i) < tau). x* comes from the linear cost model. The hash
+                # chain is anchored at the last matched node, so it must be advanced
+                # across the skipped [matched_len, x*) tokens to keep suffix page
+                # hashes valid. Skipped region falls back to recompute (correctness
+                # preserved); full reuse of the suffix requires the two-pass path.
+                prefetch_start = matched_len
+                cost_model = getattr(
+                    self.tree_cache, "suffix_prefetch_cost_model", None
+                )
+                if (
+                    self.tree_cache.prefetch_stop_policy == "suffix"
+                    and cost_model is not None
+                    and cost_model.enabled
+                    and match_end > matched_len
+                ):
+                    page_size = self.tree_cache.page_size
+                    x_star = cost_model.compute_x_star(
+                        matched_len, match_end, page_size
+                    )
+                    if x_star > matched_len:
+                        # advance hash chain over skipped [matched_len, x*) page-wise
+                        skipped = req.full_untruncated_fill_ids[matched_len:x_star]
+                        for i in range(0, len(skipped), page_size):
+                            last_hash = get_hash_str(
+                                skipped[i : i + page_size], last_hash
+                            )
+                        prefetch_start = x_star
+
+                new_input_tokens = req.full_untruncated_fill_ids[
+                    prefetch_start:match_end
+                ]
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)

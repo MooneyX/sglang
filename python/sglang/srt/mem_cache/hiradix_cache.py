@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     TreeNode,
 )
+from sglang.srt.mem_cache.suffix_prefetch_policy import SuffixPrefetchCostModel
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     split_node_hash_value,
@@ -120,12 +121,14 @@ class HiRadixCache(RadixCache):
             prefetch_threshold,
             prefetch_timeout_config,
             hicache_storage_pass_prefix_keys,
+            suffix_prefetch_cost_model,
         ) = self._parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+        self.suffix_prefetch_cost_model = suffix_prefetch_cost_model
 
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, DSATokenToKVPool):
@@ -354,7 +357,7 @@ class HiRadixCache(RadixCache):
         """
         # Validate inputs first (no side effects).
         if hicache_storage_prefetch_policy is not None:
-            allowed = ["best_effort", "wait_complete", "timeout"]
+            allowed = ["best_effort", "wait_complete", "timeout", "suffix"]
             if hicache_storage_prefetch_policy not in allowed:
                 return (
                     False,
@@ -421,9 +424,11 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold,
                 prefetch_timeout_config,
                 hicache_storage_pass_prefix_keys,
+                suffix_prefetch_cost_model,
             ) = self._parse_storage_backend_extra_config(
                 storage_backend_extra_config_json
             )
+            self.suffix_prefetch_cost_model = suffix_prefetch_cost_model
         except Exception as e:
             logger.exception(f"Failed to parse storage_backend_extra_config_json: {e}")
             return (
@@ -666,6 +671,11 @@ class HiRadixCache(RadixCache):
             "hicache_storage_pass_prefix_keys", False
         )
 
+        # SuffixPrefetch cost model params (alpha/beta/tau); popped from extra_config.
+        suffix_prefetch_cost_model = SuffixPrefetchCostModel.from_extra_config(
+            extra_config
+        )
+
         if not isinstance(prefetch_threshold, int):
             raise ValueError(
                 f"prefetch_threshold must be int, got {type(prefetch_threshold).__name__}"
@@ -699,6 +709,7 @@ class HiRadixCache(RadixCache):
             prefetch_threshold,
             prefetch_timeout_config,
             hicache_storage_pass_prefix_keys,
+            suffix_prefetch_cost_model,
         )
 
     def reset(self):
@@ -1407,7 +1418,9 @@ class HiRadixCache(RadixCache):
                 operation.completed_tokens == len(operation.hash_value) * self.page_size
             )
 
-        if self.prefetch_stop_policy == "wait_complete":
+        if self.prefetch_stop_policy in ("wait_complete", "suffix"):
+            # "suffix": the prefetched suffix must complete so it can be reused
+            # consistently alongside the GPU-recomputed prefix (see SuffixPrefetch).
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
             can_terminate = completed or self.is_prefetch_timeout(operation)
