@@ -48,6 +48,11 @@ class SuffixPrefetchCostModel:
     ls_decay: float = 0.98            # 最小二乘的遗忘因子（越小越看重近期样本）
     min_recompute_samples: int = 8    # alpha/beta 生效所需最小 chunk 样本数
     min_prefetch_samples: int = 2     # tau 生效所需最小 prefetch 样本数
+    # 采样过滤：只接受 token 数 >= 该阈值的 prefill chunk 作为重算样本。
+    # 小 chunk（尤其 tokens<=1 的 decode/收尾前向）的 gap_latency 里混入了大量
+    # 调度/等待时间，会算出荒谬的每 token 成本（真机见过 739ms、5489ms/tok），
+    # 毒化最小二乘并把 beta 拉高到 c(i)≫tau、恒定误判全预取。默认过滤 <64 token。
+    min_chunk_tokens_for_fit: int = 64
 
     # ---- 在线统计的内部状态（不参与 __init__ 的位置参数） ----
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -108,6 +113,16 @@ class SuffixPrefetchCostModel:
         if not self.online_fit:
             return
         if num_tokens <= 0 or elapsed_s <= 0.0:
+            return
+        # 过滤小 chunk：其 gap_latency 混入调度/等待时间，每 token 成本不可信。
+        if num_tokens < self.min_chunk_tokens_for_fit:
+            logger.debug(
+                "[SuffixPrefetch][obs-recompute] SKIP small chunk tokens=%d "
+                "(<%d) c_raw_ms/tok=%.2f",
+                num_tokens,
+                self.min_chunk_tokens_for_fit,
+                (elapsed_s / num_tokens) * 1e3,
+            )
             return
         i_mid = start_pos + num_tokens / 2.0
         c_obs = elapsed_s / num_tokens
@@ -240,5 +255,8 @@ class SuffixPrefetchCostModel:
             ),
             min_prefetch_samples=int(
                 extra_config.pop("suffix_prefetch_min_prefetch_samples", 2)
+            ),
+            min_chunk_tokens_for_fit=int(
+                extra_config.pop("suffix_prefetch_min_chunk_tokens_for_fit", 64)
             ),
         )
