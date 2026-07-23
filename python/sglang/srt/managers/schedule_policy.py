@@ -724,6 +724,28 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        # SuffixPrefetch pass ②: if the re-matched chunked_req found the re-anchored
+        # suffix [x*, N) as a host hit, load it back to device and extend
+        # prefix_indices so this pass reuses it instead of recomputing. Strictly
+        # gated: only when the suffix policy recorded x* and there is a host hit.
+        if (
+            getattr(req, "suffix_prefetch_x_star", 0) > 0
+            and getattr(req, "host_hit_length", 0) > 0
+            and req.needs_host_load_back()
+        ):
+            new_indices, req.last_node = self.tree_cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=req.best_match_node,
+                    host_hit_length=req.host_hit_length,
+                    req=req,
+                )
+            )
+            req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+            req.cache_protected_len = len(req.prefix_indices)
+            # recompute the extend length after reusing the loaded-back suffix
+            cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
+                req.prefix_indices
+            )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)

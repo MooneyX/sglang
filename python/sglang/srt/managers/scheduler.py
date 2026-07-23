@@ -2911,7 +2911,20 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
+            # SuffixPrefetch pass ②: for a suffix-policy chunked_req whose suffix was
+            # re-anchored under x*, re-match against the tree so the now-reachable
+            # prefetched suffix [x*, N) is discovered (host hit) and can be loaded
+            # back in add_chunked_req, instead of being recomputed. Guarded strictly
+            # on the suffix policy + a recorded x*; all other chunked reqs keep the
+            # original no-rematch behavior.
+            if (
+                self.enable_hicache_storage
+                and getattr(self.tree_cache, "prefetch_stop_policy", None) == "suffix"
+                and getattr(self.chunked_req, "suffix_prefetch_x_star", 0) > 0
+            ):
+                self.chunked_req.init_next_round_input(self.tree_cache)
+            else:
+                self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
