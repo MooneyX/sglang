@@ -227,6 +227,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -2321,6 +2322,9 @@ class Scheduler(
                         # chunk here (recompute [matched_len, x*)) and reuse the
                         # prefetched suffix [x*, match_end) in the next pass.
                         req.suffix_prefetch_x_star = x_star
+                        # Record matched_len (gap start) so pass ② can reconstruct
+                        # the [matched_len, x*) gap key for suffix re-anchoring.
+                        req.suffix_prefetch_matched_len = matched_len
 
                 new_input_tokens = req.full_untruncated_fill_ids[
                     prefetch_start:match_end
@@ -2547,6 +2551,38 @@ class Scheduler(
 
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+        # SuffixPrefetch: pass ① just cached [matched_len, x*) into the tree, so the
+        # gap down to x* is now materialized. Re-anchor the prefetched suffix
+        # [x*, N) under the x* node so pass ② re-match can reuse it instead of
+        # recomputing. No-op unless the "suffix" policy recorded a pending node.
+        self._maybe_reanchor_suffix(req)
+
+    def _maybe_reanchor_suffix(self, req: Req):
+        if not self.enable_hicache_storage:
+            return
+        reanchor = getattr(self.tree_cache, "reanchor_prefetched_suffix", None)
+        if reanchor is None:
+            return
+        x_star = getattr(req, "suffix_prefetch_x_star", 0)
+        if not x_star or x_star <= 0:
+            return
+        pending = getattr(self.tree_cache, "pending_suffix_reanchor", None)
+        if not pending or req.rid not in pending:
+            return
+        # The gap [matched_len, x*) is what pass ① recomputed. matched_len is the
+        # position the suffix prefetch started skipping from; recover it from the
+        # orphan's anchor depth is fragile, so derive the gap from the request:
+        # anchor sits at (x* - len(first_chunk_recomputed)). The first chunk stopped
+        # exactly at x*, so [prefix_at_admission, x*) is the gap. We reconstruct the
+        # gap tokens as full_untruncated_fill_ids[matched_len:x*]; matched_len is
+        # stored alongside x* at prefetch time.
+        matched_len = getattr(req, "suffix_prefetch_matched_len", 0)
+        gap_tokens = req.full_untruncated_fill_ids[matched_len:x_star]
+        gap_key = RadixKey(token_ids=gap_tokens, extra_key=req.extra_key)
+        try:
+            self.tree_cache.reanchor_prefetched_suffix(req.rid, gap_key)
+        except Exception as e:
+            logger.warning(f"SuffixPrefetch reanchor call failed for {req.rid}: {e}")
 
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.

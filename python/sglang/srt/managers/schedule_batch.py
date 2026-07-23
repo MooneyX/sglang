@@ -869,6 +869,10 @@ class Req(ReqDllmMixin):
         # chunk stops here), [x*, N) is reused from the prefetched suffix.
         # 0 means "not set / not applicable".
         self.suffix_prefetch_x_star: int = 0
+        # SuffixPrefetch: matched_len at prefetch time (device+host hit), i.e. the
+        # start of the recomputed gap [matched_len, x*). Used to reconstruct the gap
+        # key for re-anchoring the prefetched suffix in pass ②.
+        self.suffix_prefetch_matched_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is

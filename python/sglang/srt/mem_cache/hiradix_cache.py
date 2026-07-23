@@ -181,6 +181,11 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        # SuffixPrefetch: track suffix nodes that were prefetched from x* (with a
+        # structural gap [matched_len, x*) left for recompute). Key: request_id,
+        # value: the freshly inserted suffix TreeNode. It is re-anchored under the
+        # recomputed x* node once pass ① caches [matched_len, x*).
+        self.pending_suffix_reanchor: dict[str, TreeNode] = {}
         self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
@@ -718,6 +723,7 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.pending_suffix_reanchor.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -1480,12 +1486,26 @@ class HiRadixCache(RadixCache):
         min_completed_tokens = completed_tokens_tensor.item()
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
+        matched_length, inserted_suffix_node = self._insert_helper_host(
             last_host_node,
             fetched_key,
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
         )
+
+        # SuffixPrefetch: under the "suffix" policy the prefetch key starts at x*
+        # (the region [matched_len, x*) was skipped for GPU recompute). The freshly
+        # inserted suffix therefore hangs directly under last_host_node with a
+        # structural gap, so pass ② re-match cannot reach it. Record the node here;
+        # it is re-anchored under the recomputed x* node after pass ① caches the
+        # gap (see reanchor_prefetched_suffix). Protect its host memory until then.
+        if (
+            self.prefetch_stop_policy == "suffix"
+            and inserted_suffix_node is not None
+            and matched_length == 0
+        ):
+            inserted_suffix_node.protect_host()
+            self.pending_suffix_reanchor[req_id] = inserted_suffix_node
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
         self.cache_controller.append_host_mem_release(
@@ -1503,6 +1523,89 @@ class HiRadixCache(RadixCache):
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
         return True
+
+    def reanchor_prefetched_suffix(self, req_id: str, gap_key: RadixKey) -> bool:
+        """SuffixPrefetch pass ② glue: move the prefetched suffix under the x* node.
+
+        Under the "suffix" policy the suffix [x*, N) was prefetched and inserted as
+        a direct child of the anchor node (position matched_len) — but its key starts
+        at x*, leaving a structural gap over [matched_len, x*). After pass ① caches
+        the gap on GPU, the tree gains the intermediate nodes down to x*. This walks
+        the anchor node (the orphan's current parent) along ``gap_key`` (the
+        [matched_len, x*) tokens) to locate the x* node, then re-parents the orphan
+        suffix under it so pass ② re-match can finally reach it. Returns True on
+        success.
+
+        Conservative by design: if the gap path is not fully materialized, or the
+        target child slot is occupied, it leaves the tree untouched and the suffix
+        simply falls back to recompute (correctness preserved, no reuse).
+        """
+        orphan = self.pending_suffix_reanchor.pop(req_id, None)
+        if orphan is None:
+            return False
+
+        try:
+            anchor_node = orphan.parent
+            # If the gap is empty (x* == matched_len) the suffix is already anchored
+            # correctly; nothing to move.
+            if gap_key is None or len(gap_key) == 0 or anchor_node is None:
+                orphan.release_host()
+                return True
+
+            # Walk from anchor_node down the gap tokens page by page to find x* node.
+            node = anchor_node
+            key = gap_key
+            while len(key) > 0:
+                child_key = key.child_key(self.page_size)
+                if child_key not in node.children:
+                    # gap not fully materialized -> abort, keep tree intact
+                    orphan.release_host()
+                    return False
+                child = node.children[child_key]
+                prefix_len = child.key.match(key, page_size=self.page_size)
+                if prefix_len < len(child.key):
+                    # gap ends inside this node; the x* boundary is not on a node
+                    # boundary -> abort (page-aligned x* should avoid this)
+                    orphan.release_host()
+                    return False
+                node = child
+                key = key[prefix_len:]
+
+            x_star_node = node
+
+            # The orphan's first-page child key must be free under x*_node.
+            orphan_child_key = orphan.key.child_key(self.page_size)
+            if orphan_child_key in x_star_node.children:
+                # x* node already has this suffix (e.g. re-match already linked it)
+                orphan.release_host()
+                return False
+
+            # Re-parent: detach from anchor_node, attach under x*_node.
+            anchor_child_key = orphan.key.child_key(self.page_size)
+            if anchor_node.children.get(anchor_child_key) is orphan:
+                del anchor_node.children[anchor_child_key]
+            orphan.parent = x_star_node
+            x_star_node.children[orphan_child_key] = orphan
+            orphan.release_host()
+
+            # Refresh leaf/host-leaf bookkeeping for both ends.
+            self._update_host_leaf_status(anchor_node)
+            self._update_leaf_status(x_star_node)
+            self._update_host_leaf_status(x_star_node)
+            self._update_host_leaf_status(orphan)
+            logger.debug(
+                f"SuffixPrefetch: re-anchored prefetched suffix for {req_id} "
+                f"under x* node {x_star_node.id}"
+            )
+            return True
+        except Exception as e:
+            # Never let tree surgery crash the scheduler; fall back to recompute.
+            logger.warning(f"SuffixPrefetch reanchor failed for {req_id}: {e}")
+            try:
+                orphan.release_host()
+            except Exception:
+                pass
+            return False
 
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:
@@ -1618,11 +1721,12 @@ class HiRadixCache(RadixCache):
     ):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
-            return 0
+            return 0, None
 
         child_key = key.child_key(self.page_size)
 
         matched_length = 0
+        inserted_node = None
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
@@ -1653,8 +1757,15 @@ class HiRadixCache(RadixCache):
             # Publish the newly materialized host suffix immediately so downstream
             # cache indexers can resolve descendants that extend this L2-only prefix.
             self._record_store_event(new_node, medium=StorageMedium.CPU)
+            inserted_node = new_node
 
-        return matched_length
+        # Return both the length already present in the tree and the freshly
+        # created suffix node (if any). SuffixPrefetch needs the node handle to
+        # re-anchor a suffix that was prefetched from x* (skipping [matched_len,
+        # x*)), because it lands as a direct child of the matched_len node with a
+        # structural gap; pass ② re-match cannot reach it until it is moved under
+        # the recomputed x* node.
+        return matched_length, inserted_node
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
@@ -1800,6 +1911,14 @@ class HiRadixCache(RadixCache):
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        # SuffixPrefetch: release a pending (not yet re-anchored) suffix node so its
+        # protected host memory can be reclaimed.
+        orphan = self.pending_suffix_reanchor.pop(rid, None)
+        if orphan is not None:
+            try:
+                orphan.release_host()
+            except Exception:
+                pass
 
         if rid not in self.ongoing_prefetch:
             return
