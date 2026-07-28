@@ -2289,6 +2289,19 @@ class Scheduler(
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
 
+                if (
+                    self.server_args.hicache_storage_prefetch_policy
+                    == "suffix_race"
+                ):
+                    # Race decision at arrival: deadline = recompute cost.
+                    # If the prefetch queue is so long that waiting exceeds
+                    # the recompute cost, skip prefetch entirely and let the
+                    # request recompute right away.
+                    x = len(new_input_tokens)
+                    req.race_deadline = self.tree_cache.est_recompute_time(x)
+                    if self.tree_cache.est_prefetch_wait(x) > req.race_deadline:
+                        return
+
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
@@ -2314,6 +2327,7 @@ class Scheduler(
             # Reset pure-queue timer stamps (for re-queued requests)
             req.queue_exit_perf = None
             req.queue_exit_mono = None
+            req.race_deadline = getattr(req, "race_deadline", None)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2891,6 +2905,22 @@ class Scheduler(
                 if getattr(req, "queue_exit_perf", None) is None:
                     req.queue_exit_perf = time.perf_counter()
                     req.queue_exit_mono = time.monotonic()
+                if (
+                    self.server_args.hicache_storage_prefetch_policy
+                    == "suffix_race"
+                    and getattr(req, "race_deadline", None) is not None
+                ):
+                    # suffix_race admission gate: wait for prefetch only while
+                    # the wait is cheaper than recomputing (deadline set at
+                    # arrival). Past the deadline, terminate the prefetch and
+                    # recompute the rest -- TTFT capped by recompute cost.
+                    waited = (
+                        time.perf_counter() - req.time_stats.wait_queue_entry_time
+                    )
+                    if waited >= req.race_deadline:
+                        self.tree_cache.terminate_prefetch(req.rid)
+                    elif self.tree_cache.prefetch_incomplete(req.rid):
+                        continue
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch

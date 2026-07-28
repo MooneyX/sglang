@@ -182,6 +182,17 @@ class HiRadixCache(RadixCache):
         # key: request_id, value: dict with prefetch_len / completed_tokens /
         # loaded_from_storage / prefetch_dur
         self.prefetch_measure_by_reqid: dict[str, dict] = {}
+        # --- suffix_race policy state ---
+        # Recompute-cost model constants (seconds): T_rec(x) = a*x + 0.5*b*x^2.
+        # Overridable via hicache_storage_backend_extra_config keys
+        # race_recompute_a_us / race_recompute_b_us.
+        self.race_recompute_a_us = 79.5
+        self.race_recompute_b_us = 5.33e-3
+        # EWMA of full prefetch op wall time (queue+exec) and per-token fetch
+        # time, used to estimate prefetch queue wait for race decisions.
+        self.pf_op_time_ewma: Optional[float] = None
+        self.pf_token_time_ewma: Optional[float] = None
+        self._load_race_config(server_args)
         self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
@@ -195,6 +206,65 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves = set()
 
         super().__init__(params=params)
+
+    def _load_race_config(self, server_args):
+        """Best-effort parse of race model constants from storage extra config."""
+        raw = getattr(server_args, "hicache_storage_backend_extra_config", None)
+        if not raw or not isinstance(raw, str):
+            return
+        try:
+            cfg = json.loads(raw)
+            self.race_recompute_a_us = float(
+                cfg.get("race_recompute_a_us", self.race_recompute_a_us)
+            )
+            self.race_recompute_b_us = float(
+                cfg.get("race_recompute_b_us", self.race_recompute_b_us)
+            )
+        except Exception:
+            pass
+
+    def est_recompute_time(self, num_tokens: int) -> float:
+        """Estimated GPU recompute time (seconds) for num_tokens of KV."""
+        a = self.race_recompute_a_us * 1e-6
+        b = self.race_recompute_b_us * 1e-6
+        return a * num_tokens + 0.5 * b * num_tokens * num_tokens
+
+    def est_prefetch_wait(self, num_tokens: int) -> float:
+        """Estimated wall time (seconds) for a prefetch of num_tokens issued
+        now, including queueing behind pending prefetch tasks."""
+        cc = self.cache_controller
+        q = cc.prefetch_queue.qsize()
+        buf = getattr(cc, "prefetch_buffer", None)
+        if buf is not None:
+            q += buf.qsize()
+        op_time = self.pf_op_time_ewma if self.pf_op_time_ewma else 0.5
+        token_time = self.pf_token_time_ewma if self.pf_token_time_ewma else 48e-6
+        return q * op_time + num_tokens * token_time
+
+    def prefetch_incomplete(self, req_id: str) -> bool:
+        """True if req has an ongoing prefetch that has not fully completed."""
+        info = self.ongoing_prefetch.get(req_id)
+        if info is None:
+            return False
+        op = info[3]
+        target = len(op.hash_value) * self.page_size
+        if target == 0:
+            return True  # hit query still pending
+        return op.completed_tokens < target
+
+    def _update_pf_ewma(self, op_duration: float, completed_tokens: int):
+        if op_duration <= 0:
+            return
+        if self.pf_op_time_ewma is None:
+            self.pf_op_time_ewma = op_duration
+        else:
+            self.pf_op_time_ewma = 0.8 * self.pf_op_time_ewma + 0.2 * op_duration
+        if completed_tokens > 0:
+            tt = op_duration / completed_tokens
+            if self.pf_token_time_ewma is None:
+                self.pf_token_time_ewma = tt
+            else:
+                self.pf_token_time_ewma = 0.8 * self.pf_token_time_ewma + 0.2 * tt
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -358,7 +428,7 @@ class HiRadixCache(RadixCache):
         """
         # Validate inputs first (no side effects).
         if hicache_storage_prefetch_policy is not None:
-            allowed = ["best_effort", "wait_complete", "timeout"]
+            allowed = ["best_effort", "wait_complete", "timeout", "suffix_race"]
             if hicache_storage_prefetch_policy not in allowed:
                 return (
                     False,
@@ -1492,11 +1562,13 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
         # Record prefetch measurement for observability (issue -> complete)
+        op_dur = time.monotonic() - operation.start_time
+        self._update_pf_ewma(op_dur, min_completed_tokens)
         self.prefetch_measure_by_reqid[req_id] = {
             "prefetch_len": len(prefetch_key),
             "completed_tokens": min_completed_tokens,
             "loaded_from_storage": loaded_from_storage,
-            "prefetch_dur": time.monotonic() - operation.start_time,
+            "prefetch_dur": op_dur,
             # completion timestamp (monotonic) for splitting queue delay into
             # prefetch-blocked wait vs. pure scheduling wait
             "done_mono": time.monotonic(),
