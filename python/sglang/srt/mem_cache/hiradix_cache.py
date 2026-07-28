@@ -1497,6 +1497,9 @@ class HiRadixCache(RadixCache):
             "completed_tokens": min_completed_tokens,
             "loaded_from_storage": loaded_from_storage,
             "prefetch_dur": time.monotonic() - operation.start_time,
+            # completion timestamp (monotonic) for splitting queue delay into
+            # prefetch-blocked wait vs. pure scheduling wait
+            "done_mono": time.monotonic(),
         }
 
         if self.enable_storage_metrics:

@@ -2884,6 +2884,10 @@ class Scheduler(
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    # mark the first time this request is blocked by prefetch,
+                    # to split queue delay into prefetch wait vs. sched wait
+                    if getattr(req, "prefetch_wait_start", None) is None:
+                        req.prefetch_wait_start = time.monotonic()
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
@@ -2891,14 +2895,23 @@ class Scheduler(
                 )
                 # Pop per-request prefetch measurement and emit one structured
                 # log line covering: arrival queue length, prefix match at
-                # arrival, L3 prefetch latency/size, and queuing delay.
+                # arrival, L3 prefetch latency/size, queuing delay split into
+                # prefetch-blocked wait and pure scheduling wait.
                 measure = (
                     self.tree_cache.pop_prefetch_measure(req.rid)
                     if hasattr(self.tree_cache, "pop_prefetch_measure")
                     else None
                 )
                 m = measure or {}
+                done_mono = m.get("done_mono")
+                wait_start = getattr(req, "prefetch_wait_start", None)
+                prefetch_wait = (
+                    max(0.0, done_mono - wait_start)
+                    if done_mono is not None and wait_start is not None
+                    else 0.0
+                )
                 queue_dur = time.perf_counter() - req.time_stats.wait_queue_entry_time
+                sched_wait = max(0.0, queue_dur - prefetch_wait)
                 logger.info(
                     f"[PrefetchMeasure] rid={req.rid} "
                     f"arrival_qlen={getattr(req, 'arrival_queue_len', -1)} "
@@ -2907,7 +2920,9 @@ class Scheduler(
                     f"prefetch_len={m.get('prefetch_len', 0)} "
                     f"prefetch_dur={m.get('prefetch_dur', 0.0):.3f} "
                     f"l3_loaded={req.storage_hit_length} "
-                    f"queue_dur={queue_dur:.3f}"
+                    f"queue_dur={queue_dur:.3f} "
+                    f"prefetch_wait={prefetch_wait:.3f} "
+                    f"sched_wait={sched_wait:.3f}"
                 )
 
             req.init_next_round_input(self.tree_cache)
