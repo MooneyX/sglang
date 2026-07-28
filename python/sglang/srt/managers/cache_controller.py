@@ -885,6 +885,8 @@ class HiCacheController:
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
+        # Record prefetch-queue depth at task arrival for observability
+        operation.arrival_qdepth = self.prefetch_queue.qsize()
         self.prefetch_queue.put(operation)
         return operation
 

@@ -1500,6 +1500,8 @@ class HiRadixCache(RadixCache):
             # completion timestamp (monotonic) for splitting queue delay into
             # prefetch-blocked wait vs. pure scheduling wait
             "done_mono": time.monotonic(),
+            # prefetch-queue depth when this task was enqueued
+            "pf_qdepth": getattr(operation, "arrival_qdepth", -1),
         }
 
         if self.enable_storage_metrics:

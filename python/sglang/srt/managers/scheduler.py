@@ -2924,6 +2924,7 @@ class Scheduler(
                     f"device_hit={len(req.prefix_indices)} "
                     f"host_hit={getattr(req, 'host_hit_length', 0)} "
                     f"prefetch_len={m.get('prefetch_len', 0)} "
+                    f"pf_qdepth={m.get('pf_qdepth', -1)} "
                     f"prefetch_dur={m.get('prefetch_dur', 0.0):.3f} "
                     f"l3_loaded={req.storage_hit_length} "
                     f"queue_dur={queue_dur:.3f} "
