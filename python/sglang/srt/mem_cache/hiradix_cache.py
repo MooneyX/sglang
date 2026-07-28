@@ -178,6 +178,10 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        # track per-request prefetch measurement for observability
+        # key: request_id, value: dict with prefetch_len / completed_tokens /
+        # loaded_from_storage / prefetch_dur
+        self.prefetch_measure_by_reqid: dict[str, dict] = {}
         self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
@@ -707,6 +711,7 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.prefetch_measure_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -1486,6 +1491,14 @@ class HiRadixCache(RadixCache):
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
+        # Record prefetch measurement for observability (issue -> complete)
+        self.prefetch_measure_by_reqid[req_id] = {
+            "prefetch_len": len(prefetch_key),
+            "completed_tokens": min_completed_tokens,
+            "loaded_from_storage": loaded_from_storage,
+            "prefetch_dur": time.monotonic() - operation.start_time,
+        }
+
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
@@ -1507,6 +1520,14 @@ class HiRadixCache(RadixCache):
         This should be called after check_prefetch_progress() returns True.
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+
+    def pop_prefetch_measure(self, req_id: str) -> Optional[dict]:
+        """
+        Pop and return the prefetch measurement dict for a request.
+        Returns None if no prefetch measurement was recorded.
+        This should be called after check_prefetch_progress() returns True.
+        """
+        return self.prefetch_measure_by_reqid.pop(req_id, None)
 
     def match_prefix(self, params: MatchPrefixParams):
         if self.disable:

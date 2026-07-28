@@ -2309,6 +2309,8 @@ class Scheduler(
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
+            # Record waiting-queue length at request arrival for measurement
+            req.arrival_queue_len = len(self.waiting_queue)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2886,6 +2888,26 @@ class Scheduler(
                 # Pop the number of tokens loaded from storage (L3 hits)
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
+                )
+                # Pop per-request prefetch measurement and emit one structured
+                # log line covering: arrival queue length, prefix match at
+                # arrival, L3 prefetch latency/size, and queuing delay.
+                measure = (
+                    self.tree_cache.pop_prefetch_measure(req.rid)
+                    if hasattr(self.tree_cache, "pop_prefetch_measure")
+                    else None
+                )
+                m = measure or {}
+                queue_dur = time.perf_counter() - req.time_stats.wait_queue_entry_time
+                logger.info(
+                    f"[PrefetchMeasure] rid={req.rid} "
+                    f"arrival_qlen={getattr(req, 'arrival_queue_len', -1)} "
+                    f"device_hit={len(req.prefix_indices)} "
+                    f"host_hit={getattr(req, 'host_hit_length', 0)} "
+                    f"prefetch_len={m.get('prefetch_len', 0)} "
+                    f"prefetch_dur={m.get('prefetch_dur', 0.0):.3f} "
+                    f"l3_loaded={req.storage_hit_length} "
+                    f"queue_dur={queue_dur:.3f}"
                 )
 
             req.init_next_round_input(self.tree_cache)
