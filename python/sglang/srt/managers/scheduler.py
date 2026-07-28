@@ -2311,6 +2311,9 @@ class Scheduler(
             self._prefetch_kvcache(req)
             # Record waiting-queue length at request arrival for measurement
             req.arrival_queue_len = len(self.waiting_queue)
+            # Reset pure-queue timer stamps (for re-queued requests)
+            req.queue_exit_perf = None
+            req.queue_exit_mono = None
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2881,13 +2884,16 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
+                # Pure queue delay ends here: the scheduler first considers
+                # this request for admission (it has reached the queue head).
+                # Any remaining wait after this point is prefetch blocking,
+                # not queueing. Stamp once per (re-)queue.
+                if getattr(req, "queue_exit_perf", None) is None:
+                    req.queue_exit_perf = time.perf_counter()
+                    req.queue_exit_mono = time.monotonic()
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
-                    # mark the first time this request is blocked by prefetch,
-                    # to split queue delay into prefetch wait vs. sched wait
-                    if getattr(req, "prefetch_wait_start", None) is None:
-                        req.prefetch_wait_start = time.monotonic()
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
@@ -2895,23 +2901,23 @@ class Scheduler(
                 )
                 # Pop per-request prefetch measurement and emit one structured
                 # log line covering: arrival queue length, prefix match at
-                # arrival, L3 prefetch latency/size, queuing delay split into
-                # prefetch-blocked wait and pure scheduling wait.
+                # arrival, L3 prefetch latency/size, pure queue delay
+                # (arrival -> queue head), and prefetch-blocked wait
+                # (queue head -> prefetch done).
                 measure = (
                     self.tree_cache.pop_prefetch_measure(req.rid)
                     if hasattr(self.tree_cache, "pop_prefetch_measure")
                     else None
                 )
                 m = measure or {}
-                done_mono = m.get("done_mono")
-                wait_start = getattr(req, "prefetch_wait_start", None)
-                prefetch_wait = (
-                    max(0.0, done_mono - wait_start)
-                    if done_mono is not None and wait_start is not None
-                    else 0.0
+                done_mono = m.get("done_mono", req.queue_exit_mono)
+                prefetch_wait = max(0.0, done_mono - req.queue_exit_mono)
+                queue_dur = (
+                    req.queue_exit_perf - req.time_stats.wait_queue_entry_time
                 )
-                queue_dur = time.perf_counter() - req.time_stats.wait_queue_entry_time
-                sched_wait = max(0.0, queue_dur - prefetch_wait)
+                total_wait = (
+                    time.perf_counter() - req.time_stats.wait_queue_entry_time
+                )
                 logger.info(
                     f"[PrefetchMeasure] rid={req.rid} "
                     f"arrival_qlen={getattr(req, 'arrival_queue_len', -1)} "
@@ -2922,7 +2928,7 @@ class Scheduler(
                     f"l3_loaded={req.storage_hit_length} "
                     f"queue_dur={queue_dur:.3f} "
                     f"prefetch_wait={prefetch_wait:.3f} "
-                    f"sched_wait={sched_wait:.3f}"
+                    f"total_wait={total_wait:.3f}"
                 )
 
             req.init_next_round_input(self.tree_cache)
