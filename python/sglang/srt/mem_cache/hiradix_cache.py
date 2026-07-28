@@ -1486,6 +1486,13 @@ class HiRadixCache(RadixCache):
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
             can_terminate = completed or self.is_prefetch_timeout(operation)
+        elif self.prefetch_stop_policy == "suffix_race":
+            # Terminate when complete, or when the recompute-cost deadline
+            # recorded at issue has expired. Cross-rank consensus is handled
+            # by the all-reduce below (terminate only if all ranks agree).
+            expire = getattr(operation, "race_expire_perf", None)
+            expired = expire is not None and time.perf_counter() >= expire
+            can_terminate = completed or expired
         else:
             # unknown prefetch stop policy, just return True
             return True

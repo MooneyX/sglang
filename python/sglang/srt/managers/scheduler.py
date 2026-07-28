@@ -2296,10 +2296,19 @@ class Scheduler(
                     # Race decision at arrival: deadline = recompute cost.
                     # If the prefetch queue is so long that waiting exceeds
                     # the recompute cost, skip prefetch entirely and let the
-                    # request recompute right away.
+                    # request recompute right away. The skip vote MUST be
+                    # reconciled across TP ranks (collective), otherwise
+                    # divergent ongoing_prefetch state deadlocks the ranks.
                     x = len(new_input_tokens)
                     req.race_deadline = self.tree_cache.est_recompute_time(x)
-                    if self.tree_cache.est_prefetch_wait(x) > req.race_deadline:
+                    skip = (
+                        self.tree_cache.est_prefetch_wait(x) > req.race_deadline
+                    )
+                    vote = torch.tensor([int(skip)], dtype=torch.int)
+                    self.tree_cache._all_reduce_attn_groups(
+                        vote, torch.distributed.ReduceOp.MAX
+                    )
+                    if vote.item() == 1:
                         return
 
                 prefix_keys = (
@@ -2314,6 +2323,19 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
+                if (
+                    self.server_args.hicache_storage_prefetch_policy
+                    == "suffix_race"
+                    and req.rid in self.tree_cache.ongoing_prefetch
+                ):
+                    # Record the recompute-cost deadline on the operation so
+                    # can_terminate_prefetch can expire it (per-rank wall
+                    # clock is fine here; cross-rank consensus happens in
+                    # can_terminate_prefetch's all-reduce).
+                    op = self.tree_cache.ongoing_prefetch[req.rid][3]
+                    op.race_expire_perf = (
+                        time.perf_counter() + req.race_deadline
+                    )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -2905,22 +2927,10 @@ class Scheduler(
                 if getattr(req, "queue_exit_perf", None) is None:
                     req.queue_exit_perf = time.perf_counter()
                     req.queue_exit_mono = time.monotonic()
-                if (
-                    self.server_args.hicache_storage_prefetch_policy
-                    == "suffix_race"
-                    and getattr(req, "race_deadline", None) is not None
-                ):
-                    # suffix_race admission gate: wait for prefetch only while
-                    # the wait is cheaper than recomputing (deadline set at
-                    # arrival). Past the deadline, terminate the prefetch and
-                    # recompute the rest -- TTFT capped by recompute cost.
-                    waited = (
-                        time.perf_counter() - req.time_stats.wait_queue_entry_time
-                    )
-                    if waited >= req.race_deadline:
-                        self.tree_cache.terminate_prefetch(req.rid)
-                    elif self.tree_cache.prefetch_incomplete(req.rid):
-                        continue
+                # NOTE: for suffix_race the wait/terminate decision lives in
+                # can_terminate_prefetch and is reconciled across TP ranks via
+                # all-reduce. Do NOT branch on wall-clock deadlines here --
+                # divergent branches across ranks would deadlock collectives.
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
