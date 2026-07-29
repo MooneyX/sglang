@@ -2313,13 +2313,14 @@ class Scheduler(
                 )
 
     def _race_step(self, req: Req):
-        """suffix_race consumption step: copy newly prefetched pages
-        host->device and extend the request's prefix so it skips recomputing
-        them, then resolve the race when the compute frontier catches up.
+        """suffix_race consumption step (tail-first prefetch): once the GPU
+        compute frontier reaches the fetched tail, copy the whole fetched
+        region host->device, extend the prefix to the fetch end, and resolve
+        the race. The fetched region is contiguous from the tail, so
+        consumption is a one-shot event at the meeting point.
 
-        Must only read consensus-checked state: completed_tokens is
-        MIN-reduced across TP ranks before use (io threads on different ranks
-        may progress at slightly different rates)."""
+        Must only read consensus-checked state: completed_from_end is
+        MIN-reduced across TP ranks before use."""
         tc = self.tree_cache
         if getattr(req, "race_fetch_start", None) is None:
             return
@@ -2327,76 +2328,54 @@ class Scheduler(
         t = torch.tensor(
             [
                 1 if info is not None else 0,
-                info[3].completed_tokens if info is not None else 0,
+                info[3].completed_from_end if info is not None else 0,
             ],
             dtype=torch.int,
         )
         tc._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN)
-        present, done = int(t[0].item()), int(t[1].item())
+        present, cfe = int(t[0].item()), int(t[1].item())
         if not present:
             return
         last_host_node, prefetch_key, host_indices, op = info
-        target = len(op.hash_value) * tc.page_size if op.hash_value else 0
-        if target > 0:
-            done = min(done, target)
+        total = len(prefetch_key)
+        cfe = min(cfe, total)
+        fetch_end = req.race_fetch_start + total
+        fetched_from = fetch_end - cfe
         cur = len(req.prefix_indices)
-        fetched_end = req.race_fetch_start + done
-        n = fetched_end - cur
         logger.info(
-            f"[RaceStep] rid={req.rid} done={done} target={target} "
-            f"cur={cur} fetch_start={req.race_fetch_start} n={n}"
+            f"[RaceStep] rid={req.rid} cfe={cfe} total={total} "
+            f"cur={cur} fetched_from={fetched_from}"
         )
-        if n > 0:
-            off = cur - req.race_fetch_start
-            ack_id = tc.race_register_load_ack(last_host_node)
-            device_indices = tc.cache_controller.load(
-                host_indices[off : off + n], node_id=ack_id
-            )
-            if device_indices is not None:
-                req.prefix_indices = torch.cat(
-                    [req.prefix_indices, device_indices]
+        if cfe > 0 and cur >= fetched_from:
+            # Meeting point: everything beyond cur has been fetched.
+            n = fetch_end - cur
+            if n > 0:
+                off = cur - req.race_fetch_start
+                ack_id = tc.race_register_load_ack(last_host_node)
+                device_indices = tc.cache_controller.load(
+                    host_indices[off : off + total], node_id=ack_id
                 )
-                cur += n
-                logger.info(f"[RaceConsume] rid={req.rid} n={n}")
-            else:
-                tc.race_unregister_load_ack(ack_id, last_host_node)
-                logger.info(f"[RaceConsume] rid={req.rid} LOAD_FAILED n={n}")
-        # Resolve the race: fully fetched and fully consumed, or the GPU
-        # frontier has moved past the fetch start while the prefetch is
-        # still queued (further fetching would only duplicate the GPU's own
-        # compute). At cur == fetch_start the race has simply not begun yet,
-        # so "not started" alone must NOT trigger a give-up.
-        fully_fetched = target > 0 and done >= target
-        started = target > 0 or done > 0
-        if cur >= fetched_end:
-            if fully_fetched or (not started and cur > req.race_fetch_start):
-                self._race_finalize(req)
+                if device_indices is not None:
+                    req.prefix_indices = torch.cat(
+                        [req.prefix_indices, device_indices]
+                    )
+                    logger.info(f"[RaceConsume] rid={req.rid} n={n}")
+                else:
+                    tc.race_unregister_load_ack(ack_id, last_host_node)
+                    logger.info(f"[RaceConsume] rid={req.rid} LOAD_FAILED n={n}")
+                    return  # retry next round; do not finalize yet
+            self._race_finalize(req)
 
     def _race_finalize(self, req: Req):
-        """Stop and finalize the racing prefetch for a request: terminate any
-        remainder, insert fetched pages into the tree for future reuse, and
-        emit the final measurement line."""
+        """Stop and finalize the racing (tail-first) prefetch: terminate the
+        remainder, release host pages (deferred), and log the measurement."""
         tc = self.tree_cache
-        if req.rid in tc.ongoing_prefetch:
-            # Always mark terminate: with a pending hit query (target == 0)
-            # `completed < target` would be False and the op would leak and
-            # keep fetching unconsumable pages.
-            tc.terminate_prefetch(req.rid)
-            tc.check_prefetch_progress(req.rid)
-        elif getattr(req, "race_fetch_start", None) is None:
-            return
+        m = tc.race_finalize_prefetch(req.rid)
         req.race_fetch_start = None
-        m = (
-            tc.pop_prefetch_measure(req.rid)
-            if hasattr(tc, "pop_prefetch_measure")
-            else None
-        ) or {}
-        l3_loaded = tc.pop_prefetch_loaded_tokens(req.rid)
         logger.info(
             f"[RaceFinalize] rid={req.rid} "
             f"prefetch_len={m.get('prefetch_len', 0)} "
             f"completed={m.get('completed_tokens', 0)} "
-            f"l3_loaded={l3_loaded} "
             f"prefetch_dur={m.get('prefetch_dur', 0.0):.3f}"
         )
 

@@ -182,8 +182,14 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        reverse: bool = False,
     ):
         self.request_id = request_id
+        # reverse=True (suffix_race): fetch pages from the tail backward,
+        # skip the storage hit query (optimistic fetch), and track
+        # completed_from_end instead of completed_tokens.
+        self.reverse = reverse
+        self.completed_from_end = 0
 
         self._lock = threading.Lock()
         self._terminated_flag = False
@@ -198,12 +204,20 @@ class PrefetchOperation(StorageOperation):
             self.completed_tokens += num_tokens
             return True
 
+    def increment_from_end(self, num_tokens: int):
+        with self._lock:
+            if self._terminated_flag:
+                return False
+            self.completed_from_end += num_tokens
+            return True
+
     def mark_terminate(self):
         with self._lock:
             self._terminated_flag = True
 
     def is_terminated(self) -> bool:
-        return self._terminated_flag
+        with self._lock:
+            return self._terminated_flag
 
 
 class HiCacheController:
@@ -878,12 +892,14 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        reverse: bool = False,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id, host_indices, new_input_tokens, last_hash, prefix_keys,
+            reverse=reverse,
         )
         # Record prefetch-queue depth at task arrival for observability
         operation.arrival_qdepth = self.prefetch_queue.qsize()
@@ -915,7 +931,10 @@ class HiCacheController:
                 )
                 break
             inc += self.page_size
-        operation.increment(inc)
+        if operation.reverse:
+            operation.increment_from_end(inc)
+        else:
+            operation.increment(inc)
 
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
@@ -943,10 +962,25 @@ class HiCacheController:
     def _page_transfer(self, operation):
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+        n_pages = len(operation.hash_value)
+        if operation.reverse:
+            # suffix_race: fetch from the tail backward so the most
+            # expensive (latest-position) pages are secured first.
+            ranges = []
+            end = n_pages
+            while end > 0:
+                start = max(0, end - STORAGE_BATCH_SIZE)
+                ranges.append((start, end))
+                end = start
+        else:
+            ranges = [
+                (i, min(i + STORAGE_BATCH_SIZE, n_pages))
+                for i in range(0, n_pages, STORAGE_BATCH_SIZE)
+            ]
+        for start, end in ranges:
+            batch_hashes = operation.hash_value[start:end]
             batch_host_indices = operation.host_indices[
-                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                start * self.page_size : end * self.page_size
             ]
 
             # Best-effort draft L3 read before publishing target completion.
@@ -955,15 +989,21 @@ class HiCacheController:
             if self.has_draft:
                 self._draft_page_get(batch_hashes, batch_host_indices)
 
-            prev_completed_tokens = operation.completed_tokens
+            prev_completed = (
+                operation.completed_from_end
+                if operation.reverse
+                else operation.completed_tokens
+            )
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
             # Check termination
-            if (
-                operation.completed_tokens
-                != prev_completed_tokens + len(batch_hashes) * self.page_size
-            ):
+            now_completed = (
+                operation.completed_from_end
+                if operation.reverse
+                else operation.completed_tokens
+            )
+            if now_completed != prev_completed + len(batch_hashes) * self.page_size:
                 operation.mark_terminate()
                 break  # Some operations fail or operation terminated by controller
 
@@ -981,9 +1021,18 @@ class HiCacheController:
                     continue
                 self._page_transfer(operation)
                 # operation terminated by controller, release pre-allocated memory
-                self.append_host_mem_release(
-                    operation.host_indices[operation.completed_tokens :]
-                )
+                if operation.reverse:
+                    # fetched pages are the tail; release the unfetched head
+                    self.append_host_mem_release(
+                        operation.host_indices[
+                            : len(operation.hash_value) * self.page_size
+                            - operation.completed_from_end
+                        ]
+                    )
+                else:
+                    self.append_host_mem_release(
+                        operation.host_indices[operation.completed_tokens :]
+                    )
             except Empty:
                 continue
 
@@ -1040,6 +1089,22 @@ class HiCacheController:
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
+                    continue
+                if operation.reverse:
+                    # suffix_race optimistic fetch: skip the hit query
+                    # entirely (it is the dominant startup latency), just
+                    # compute the page hash chain and start fetching. Pages
+                    # missing from storage truncate the fetch naturally.
+                    hash_value = []
+                    last_hash = operation.last_hash
+                    tokens_to_fetch = operation.token_ids
+                    for i in range(0, len(tokens_to_fetch), self.page_size):
+                        last_hash = self.get_hash_str(
+                            tokens_to_fetch[i : i + self.page_size], last_hash
+                        )
+                        hash_value.append(last_hash)
+                    operation.hash_value = hash_value
+                    self.prefetch_buffer.put(operation)
                     continue
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
                 storage_hit_count_tensor = torch.tensor(

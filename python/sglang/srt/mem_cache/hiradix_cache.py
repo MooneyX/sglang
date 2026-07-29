@@ -271,6 +271,35 @@ class HiRadixCache(RadixCache):
         if self.ongoing_load_back.pop(ack_id, None) is not None:
             self.dec_lock_ref(node)
 
+    def race_finalize_prefetch(self, req_id: str) -> dict:
+        """Stop and clean up a reverse (suffix_race) prefetch operation.
+
+        Unlike check_prefetch_progress, this does NOT insert fetched pages
+        into the tree: a racing request consumes fetched pages directly via
+        host->device copies, and the request's own write-back path records
+        the full KV sequence for future reuse. Fetched-tail operations are
+        finalized here: terminate, release all host pages (deferred release
+        to stay clear of in-flight load copies), and free bookkeeping.
+        Returns the final measurement dict."""
+        info = self.ongoing_prefetch.pop(req_id, None)
+        if info is None:
+            return {}
+        last_host_node, prefetch_key, host_indices, operation = info
+        last_host_node.release_host()
+        operation.mark_terminate()
+        cfe = getattr(operation, "completed_from_end", 0)
+        dur = time.monotonic() - operation.start_time
+        # Deferred release for all pages: load copies issued by _race_step
+        # may still be in flight this pass.
+        self.cache_controller.append_host_mem_release(host_indices)
+        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        self._update_pf_ewma(dur, cfe)
+        return {
+            "prefetch_len": len(prefetch_key),
+            "completed_tokens": cfe,
+            "prefetch_dur": dur,
+        }
+
     def _update_pf_ewma(self, op_duration: float, completed_tokens: int):
         if op_duration <= 0:
             return
@@ -1714,6 +1743,7 @@ class HiRadixCache(RadixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            reverse=(self.prefetch_stop_policy == "suffix_race"),
             **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (
