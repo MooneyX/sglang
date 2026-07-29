@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import threading
@@ -375,7 +376,7 @@ class HiCacheFile(HiCacheStorage):
         # correct content for its key). Avoids one open()+close() syscall pair
         # per page read; combined with preadv this removes most of the
         # per-page syscall/Python overhead on the prefetch hot path.
-        self._fd_cache: dict = {}
+        self._fd_cache = collections.OrderedDict()
         self._fd_cache_limit = 4096
         self._fd_cache_lock = threading.Lock()
 
@@ -383,7 +384,6 @@ class HiCacheFile(HiCacheStorage):
         with self._fd_cache_lock:
             fd = self._fd_cache.get(path)
             if fd is not None:
-                self._fd_cache[path] = fd  # refresh position (insertion order)
                 self._fd_cache.move_to_end(path)
                 return fd
         fd = os.open(path, os.O_RDONLY)
