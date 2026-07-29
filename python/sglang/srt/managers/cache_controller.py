@@ -956,7 +956,11 @@ class HiCacheController:
                 host_indices[i * self.page_size],
                 page_data[i],
             )
-            if not operation.increment(self.page_size):
+            if operation.reverse:
+                ok = operation.increment_from_end(self.page_size)
+            else:
+                ok = operation.increment(self.page_size)
+            if not ok:
                 break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
