@@ -2293,23 +2293,11 @@ class Scheduler(
                     self.server_args.hicache_storage_prefetch_policy
                     == "suffix_race"
                 ):
-                    # Race decision at arrival: deadline = recompute cost.
-                    # If the prefetch queue is so long that waiting exceeds
-                    # the recompute cost, skip prefetch entirely and let the
-                    # request recompute right away. The skip vote MUST be
-                    # reconciled across TP ranks (collective), otherwise
-                    # divergent ongoing_prefetch state deadlocks the ranks.
-                    x = len(new_input_tokens)
-                    req.race_deadline = self.tree_cache.est_recompute_time(x)
-                    skip = (
-                        self.tree_cache.est_prefetch_wait(x) > req.race_deadline
-                    )
-                    vote = torch.tensor([int(skip)], dtype=torch.int)
-                    self.tree_cache._all_reduce_attn_groups(
-                        vote, torch.distributed.ReduceOp.MAX
-                    )
-                    if vote.item() == 1:
-                        return
+                    # Pure race: always issue the prefetch. No queue-length
+                    # estimates -- GPU recompute (head-first) and the prefetch
+                    # race forward, and the meeting point is resolved
+                    # physically during chunked prefill (see _race_step).
+                    req.race_fetch_start = matched_len
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
@@ -2323,19 +2311,87 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
-                if (
-                    self.server_args.hicache_storage_prefetch_policy
-                    == "suffix_race"
-                    and req.rid in self.tree_cache.ongoing_prefetch
-                ):
-                    # Record the recompute-cost deadline on the operation so
-                    # can_terminate_prefetch can expire it (per-rank wall
-                    # clock is fine here; cross-rank consensus happens in
-                    # can_terminate_prefetch's all-reduce).
-                    op = self.tree_cache.ongoing_prefetch[req.rid][3]
-                    op.race_expire_perf = (
-                        time.perf_counter() + req.race_deadline
-                    )
+
+    def _race_step(self, req: Req):
+        """suffix_race consumption step: copy newly prefetched pages
+        host->device and extend the request's prefix so it skips recomputing
+        them, then resolve the race when the compute frontier catches up.
+
+        Must only read consensus-checked state: completed_tokens is
+        MIN-reduced across TP ranks before use (io threads on different ranks
+        may progress at slightly different rates)."""
+        tc = self.tree_cache
+        if getattr(req, "race_fetch_start", None) is None:
+            return
+        info = tc.ongoing_prefetch.get(req.rid)
+        t = torch.tensor(
+            [
+                1 if info is not None else 0,
+                info[3].completed_tokens if info is not None else 0,
+            ],
+            dtype=torch.int,
+        )
+        tc._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN)
+        present, done = int(t[0].item()), int(t[1].item())
+        if not present:
+            return
+        last_host_node, prefetch_key, host_indices, op = info
+        target = len(op.hash_value) * tc.page_size if op.hash_value else 0
+        if target > 0:
+            done = min(done, target)
+        cur = len(req.prefix_indices)
+        fetched_end = req.race_fetch_start + done
+        n = fetched_end - cur
+        if n > 0:
+            off = cur - req.race_fetch_start
+            ack_id = tc.race_register_load_ack(last_host_node)
+            device_indices = tc.cache_controller.load(
+                host_indices[off : off + n], node_id=ack_id
+            )
+            if device_indices is not None:
+                req.prefix_indices = torch.cat(
+                    [req.prefix_indices, device_indices]
+                )
+                cur += n
+            else:
+                tc.race_unregister_load_ack(ack_id, last_host_node)
+        # Resolve the race: fully fetched and fully consumed, or the GPU
+        # caught up while the prefetch was still waiting in queue (further
+        # fetching would only duplicate the GPU's own compute).
+        # NOTE: `started` must be derived from consensus values only
+        # (target is set after an all-reduced hit query; done is MIN-reduced
+        # above) -- raw op.completed_tokens may diverge across ranks.
+        fully_fetched = target > 0 and done >= target
+        started = target > 0 or done > 0
+        if cur >= fetched_end:
+            if fully_fetched or not started:
+                self._race_finalize(req)
+
+    def _race_finalize(self, req: Req):
+        """Stop and finalize the racing prefetch for a request: terminate any
+        remainder, insert fetched pages into the tree for future reuse, and
+        emit the final measurement line."""
+        tc = self.tree_cache
+        if req.rid in tc.ongoing_prefetch:
+            op = tc.ongoing_prefetch[req.rid][3]
+            target = len(op.hash_value) * tc.page_size if op.hash_value else 0
+            if op.completed_tokens < target:
+                tc.terminate_prefetch(req.rid)
+            tc.check_prefetch_progress(req.rid)
+        req.race_fetch_start = None
+        m = (
+            tc.pop_prefetch_measure(req.rid)
+            if hasattr(tc, "pop_prefetch_measure")
+            else None
+        ) or {}
+        l3_loaded = tc.pop_prefetch_loaded_tokens(req.rid)
+        logger.info(
+            f"[RaceFinalize] rid={req.rid} "
+            f"prefetch_len={m.get('prefetch_len', 0)} "
+            f"completed={m.get('completed_tokens', 0)} "
+            f"l3_loaded={l3_loaded} "
+            f"prefetch_dur={m.get('prefetch_dur', 0.0):.3f}"
+        )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -2349,7 +2405,8 @@ class Scheduler(
             # Reset pure-queue timer stamps (for re-queued requests)
             req.queue_exit_perf = None
             req.queue_exit_mono = None
-            req.race_deadline = getattr(req, "race_deadline", None)
+            if getattr(req, "race_fetch_start", None) is None:
+                req.race_fetch_start = None
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2879,8 +2936,21 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            race_mode = (
+                self.enable_hicache_storage
+                and self.server_args.hicache_storage_prefetch_policy
+                == "suffix_race"
+            )
+            if race_mode:
+                # Consume newly prefetched pages before scheduling the next
+                # chunk so the request skips recomputing them.
+                self._race_step(self.chunked_req)
+            cr = self.chunked_req
+            cr.init_next_round_input()
+            self.chunked_req = adder.add_chunked_req(cr)
+            if race_mode and self.chunked_req is None:
+                # Prefill finished: stop and finalize the racing prefetch.
+                self._race_finalize(cr)
 
         if self.enable_lora:
             running_loras = {
@@ -2927,52 +2997,104 @@ class Scheduler(
                 if getattr(req, "queue_exit_perf", None) is None:
                     req.queue_exit_perf = time.perf_counter()
                     req.queue_exit_mono = time.monotonic()
-                # NOTE: for suffix_race the wait/terminate decision lives in
-                # can_terminate_prefetch and is reconciled across TP ranks via
-                # all-reduce. Do NOT branch on wall-clock deadlines here --
-                # divergent branches across ranks would deadlock collectives.
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
-                    continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
+                race_mode = (
+                    self.server_args.hicache_storage_prefetch_policy
+                    == "suffix_race"
                 )
-                # Pop per-request prefetch measurement and emit one structured
-                # log line covering: arrival queue length, prefix match at
-                # arrival, L3 prefetch latency/size, pure queue delay
-                # (arrival -> queue head), and prefetch-blocked wait
-                # (queue head -> prefetch done).
-                measure = (
-                    self.tree_cache.pop_prefetch_measure(req.rid)
-                    if hasattr(self.tree_cache, "pop_prefetch_measure")
-                    else None
-                )
-                m = measure or {}
-                done_mono = m.get("done_mono", req.queue_exit_mono)
-                prefetch_wait = max(0.0, done_mono - req.queue_exit_mono)
-                queue_dur = (
-                    req.queue_exit_perf - req.time_stats.wait_queue_entry_time
-                )
-                total_wait = (
-                    time.perf_counter() - req.time_stats.wait_queue_entry_time
-                )
-                logger.info(
-                    f"[PrefetchMeasure] rid={req.rid} "
-                    f"arrival_qlen={getattr(req, 'arrival_queue_len', -1)} "
-                    f"device_hit={len(req.prefix_indices)} "
-                    f"host_hit={getattr(req, 'host_hit_length', 0)} "
-                    f"prefetch_len={m.get('prefetch_len', 0)} "
-                    f"pf_qdepth={m.get('pf_qdepth', -1)} "
-                    f"prefetch_dur={m.get('prefetch_dur', 0.0):.3f} "
-                    f"l3_loaded={req.storage_hit_length} "
-                    f"queue_dur={queue_dur:.3f} "
-                    f"prefetch_wait={prefetch_wait:.3f} "
-                    f"total_wait={total_wait:.3f}"
-                )
+                if race_mode:
+                    # Race: admit immediately. The prefetch keeps running and
+                    # is consumed incrementally by _race_step during chunked
+                    # prefill; finalization happens in _race_finalize.
+                    req.storage_hit_length = 0
+                    info = self.tree_cache.ongoing_prefetch.get(req.rid)
+                    op = info[3] if info is not None else None
+                    queue_dur = (
+                        req.queue_exit_perf
+                        - req.time_stats.wait_queue_entry_time
+                    )
+                    total_wait = (
+                        time.perf_counter()
+                        - req.time_stats.wait_queue_entry_time
+                    )
+                    logger.info(
+                        f"[PrefetchMeasure] rid={req.rid} "
+                        f"arrival_qlen={getattr(req, 'arrival_queue_len', -1)} "
+                        f"device_hit={len(req.prefix_indices)} "
+                        f"host_hit={getattr(req, 'host_hit_length', 0)} "
+                        f"prefetch_len={len(info[1]) if info is not None else 0} "
+                        f"pf_qdepth={getattr(op, 'arrival_qdepth', -1) if op is not None else -1} "
+                        f"prefetch_dur=0.000 "
+                        f"l3_loaded=0 "
+                        f"queue_dur={queue_dur:.3f} "
+                        f"prefetch_wait=0.000 "
+                        f"total_wait={total_wait:.3f}"
+                    )
+                else:
+                    # NOTE: for suffix_race the wait/terminate decision lives
+                    # in can_terminate_prefetch and is reconciled across TP
+                    # ranks via all-reduce. Do NOT branch on wall-clock
+                    # deadlines here -- divergent branches across ranks would
+                    # deadlock collectives.
+                    prefetch_done = self.tree_cache.check_prefetch_progress(
+                        req.rid
+                    )
+                    if not prefetch_done:
+                        # skip staging requests that are ongoing prefetch
+                        continue
+                    # Pop the number of tokens loaded from storage (L3 hits)
+                    req.storage_hit_length = (
+                        self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                    )
+                    # Pop per-request prefetch measurement and emit one
+                    # structured log line covering: arrival queue length,
+                    # prefix match at arrival, L3 prefetch latency/size,
+                    # pure queue delay (arrival -> queue head), and
+                    # prefetch-blocked wait (queue head -> prefetch done).
+                    measure = (
+                        self.tree_cache.pop_prefetch_measure(req.rid)
+                        if hasattr(self.tree_cache, "pop_prefetch_measure")
+                        else None
+                    )
+                    m = measure or {}
+                    done_mono = m.get("done_mono", req.queue_exit_mono)
+                    prefetch_wait = max(0.0, done_mono - req.queue_exit_mono)
+                    queue_dur = (
+                        req.queue_exit_perf
+                        - req.time_stats.wait_queue_entry_time
+                    )
+                    total_wait = (
+                        time.perf_counter()
+                        - req.time_stats.wait_queue_entry_time
+                    )
+                    logger.info(
+                        f"[PrefetchMeasure] rid={req.rid} "
+                        f"arrival_qlen={getattr(req, 'arrival_queue_len', -1)} "
+                        f"device_hit={len(req.prefix_indices)} "
+                        f"host_hit={getattr(req, 'host_hit_length', 0)} "
+                        f"prefetch_len={m.get('prefetch_len', 0)} "
+                        f"pf_qdepth={m.get('pf_qdepth', -1)} "
+                        f"prefetch_dur={m.get('prefetch_dur', 0.0):.3f} "
+                        f"l3_loaded={req.storage_hit_length} "
+                        f"queue_dur={queue_dur:.3f} "
+                        f"prefetch_wait={prefetch_wait:.3f} "
+                        f"total_wait={total_wait:.3f}"
+                    )
 
             req.init_next_round_input(self.tree_cache)
+            if self.enable_hicache_storage and race_mode:
+                # Consume pages the prefetch already delivered (host->device
+                # copy + prefix extension) so the request skips recomputing
+                # them. The batch's hicache_consumer_index syncs the copy.
+                self._race_step(req)
+                # Single-chunk requests finish prefill in this batch: any
+                # fetch completing later can never be consumed by them, so
+                # finalize the racing prefetch right away (fetched pages are
+                # inserted into the tree for future reuse).
+                if getattr(req, "race_fetch_start", None) is not None and (
+                    len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                    <= chunked_prefill_size
+                ):
+                    self._race_finalize(req)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

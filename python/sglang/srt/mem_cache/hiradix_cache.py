@@ -193,6 +193,9 @@ class HiRadixCache(RadixCache):
         self.pf_op_time_ewma: Optional[float] = None
         self.pf_token_time_ewma: Optional[float] = None
         self._load_race_config(server_args)
+        # Synthetic ack ids for race consumption loads (negative to avoid
+        # collision with real TreeNode ids)
+        self._race_ack_id = 0
         self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
@@ -251,6 +254,22 @@ class HiRadixCache(RadixCache):
         if target == 0:
             return True  # hit query still pending
         return op.completed_tokens < target
+
+    def race_register_load_ack(self, node: TreeNode) -> int:
+        """Register a synthetic load-back ack for race-consumption loads.
+
+        The controller's ack processing (loading_check) pops node_ids from
+        ongoing_load_back to dec lock refs; mirror load_back's inc/dec
+        bookkeeping with a unique synthetic (negative) id."""
+        self._race_ack_id -= 1
+        self.inc_lock_ref(node)
+        self.ongoing_load_back[self._race_ack_id] = node
+        return self._race_ack_id
+
+    def race_unregister_load_ack(self, ack_id: int, node: TreeNode):
+        """Roll back race_register_load_ack when the load could not start."""
+        if self.ongoing_load_back.pop(ack_id, None) is not None:
+            self.dec_lock_ref(node)
 
     def _update_pf_ewma(self, op_duration: float, completed_tokens: int):
         if op_duration <= 0:
