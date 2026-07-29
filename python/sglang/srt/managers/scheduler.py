@@ -2385,29 +2385,33 @@ class Scheduler(
                     logger.info(f"[RaceConsume] rid={req.rid} LOAD_FAILED n={n}")
                     return  # retry next round; do not finalize yet
             self._race_finalize(req)
-        elif cfe > 0:
-            # The fetcher has not covered the whole remainder. If this round
-            # schedules the final chunk, trim it: consume the fetched tail
-            # into pending slots now and let the chunk skip it, instead of
-            # recomputing pages that are already on host.
-            remaining = len(req.full_untruncated_fill_ids) - cur
-            if 0 < remaining <= (self.chunked_prefill_size or remaining):
-                tail_n = fetch_end - fetched_from
-                off = fetched_from - req.race_fetch_start
-                ack_id = tc.race_register_load_ack(last_host_node)
-                device_indices = tc.cache_controller.load(
-                    host_indices[off : off + tail_n], node_id=ack_id
+        elif (
+            cfe > 0
+            and self.chunked_prefill_size is not None
+            and cur < fetched_from <= cur + self.chunked_prefill_size
+            and fetch_end - fetched_from >= 64
+        ):
+            # The next chunk would step into the fetched region: consume
+            # the fetched tail into pending slots now and cap the chunk at
+            # the fetched boundary, instead of recomputing pages that are
+            # already on host. The prefetch is terminated since anything it
+            # could still fetch would duplicate the capped chunk's compute.
+            tail_n = fetch_end - fetched_from
+            off = fetched_from - req.race_fetch_start
+            ack_id = tc.race_register_load_ack(last_host_node)
+            device_indices = tc.cache_controller.load(
+                host_indices[off : off + tail_n], node_id=ack_id
+            )
+            if device_indices is not None:
+                req.race_tail_start = fetched_from
+                req.race_tail_slots = device_indices
+                logger.info(
+                    f"[RaceTrim] rid={req.rid} tail={tail_n} "
+                    f"cap={fetched_from}"
                 )
-                if device_indices is not None:
-                    req.race_tail_start = fetched_from
-                    req.race_tail_slots = device_indices
-                    logger.info(
-                        f"[RaceTrim] rid={req.rid} tail={tail_n} "
-                        f"cap={fetched_from}"
-                    )
-                    self._race_finalize(req)
-                else:
-                    tc.race_unregister_load_ack(ack_id, last_host_node)
+                self._race_finalize(req)
+            else:
+                tc.race_unregister_load_ack(ack_id, last_host_node)
 
     def _race_finalize(self, req: Req):
         """Stop and finalize the racing (tail-first) prefetch: terminate the
