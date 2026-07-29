@@ -14,8 +14,10 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -401,12 +403,22 @@ class HiCacheController:
             threads.append(self.backup_thread)
         if hasattr(self, "prefetch_io_aux_thread"):
             threads.append(self.prefetch_io_aux_thread)
+        threads.extend(getattr(self, "prefetch_io_aux_threads", []))
 
         for t in threads:
             try:
                 t.join(timeout=10)
             except Exception:
                 pass
+
+        # Shut down the parallel storage IO pool as well.
+        pool = getattr(self, "_storage_io_pool", None)
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
+            self._storage_io_pool = None
 
         alive = [t for t in threads if getattr(t, "is_alive", lambda: False)()]
         if alive:
@@ -915,8 +927,73 @@ class HiCacheController:
             inc += self.page_size
         operation.increment(inc)
 
-    # todo: deprecate
+    def _get_storage_io_pool(self) -> ThreadPoolExecutor:
+        """Lazily create a persistent thread pool for parallel storage page IO."""
+        pool = getattr(self, "_storage_io_pool", None)
+        if pool is None:
+            n_workers = int(os.environ.get("SGLANG_HICACHE_IO_THREADS", "8"))
+            pool = ThreadPoolExecutor(
+                max_workers=n_workers, thread_name_prefix="hicache_io"
+            )
+            self._storage_io_pool = pool
+            self._staging_local = threading.local()
+        return pool
+
+    def _staging_page(self):
+        """Per-worker reusable staging page buffer.
+
+        Avoids allocating a fresh 16MB pinned dummy page per page per batch
+        (cudaHostAlloc is expensive). One buffer per worker thread is enough:
+        it is drained into the host pool before the next task reuses it.
+        """
+        buf = getattr(self._staging_local, "page", None)
+        if buf is None:
+            buf = self.mem_pool_host.get_dummy_flat_data_page()
+            self._staging_local.page = buf
+        return buf
+
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+        # Parallel path for the file backend: pages are independent files and
+        # host-pool writes target disjoint per-page slices, so a thread pool is
+        # safe. Measured single-thread file read is CPU-bound (~0.6GB/s); a
+        # small pool lifts it to several GB/s.
+        if self.storage_backend_type == "file" and len(hash_values) > 1:
+            ok = [False] * len(hash_values)
+
+            def _load(i):
+                try:
+                    buf = self._staging_page()
+                    data = self.storage_backend.get(hash_values[i], buf)
+                    if data is None:
+                        return
+                    # Must set the data before the completed tokens are
+                    # increased, otherwise this page may be read before set.
+                    self.mem_pool_host.set_from_flat_data_page(
+                        host_indices[i * self.page_size],
+                        data,
+                    )
+                    ok[i] = True
+                except Exception as e:
+                    logger.warning(f"Parallel page get failed: {e}")
+
+            pool = self._get_storage_io_pool()
+            futures = [pool.submit(_load, i) for i in range(len(hash_values))]
+            for f in futures:
+                f.result()
+            # Count only the contiguous successful prefix (matches the old
+            # break-on-first-failure semantics).
+            inc = 0
+            for i in range(len(hash_values)):
+                if not ok[i]:
+                    logger.warning(
+                        f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
+                    )
+                    break
+                inc += self.page_size
+            if inc > 0:
+                operation.increment(inc)
+            return
+
         dummy_page_dst = [
             self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
         ]
@@ -1015,7 +1092,16 @@ class HiCacheController:
                 )
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            # Prefer the batched v2 existence check (single directory scan for
+            # the file backend) over the v1 per-key stat loop.
+            try:
+                hit_page_num = self.storage_backend.batch_exists_v2(
+                    batch_hashes, extra_info=extra_info
+                ).kv_hit_pages
+            except (NotImplementedError, AttributeError):
+                hit_page_num = self.storage_backend.batch_exists(
+                    batch_hashes, extra_info
+                )
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -1030,10 +1116,15 @@ class HiCacheController:
         Manage prefetching operations from storage backend to host memory.
         """
         self.prefetch_buffer = Queue()
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
-        )
-        self.prefetch_io_aux_thread.start()
+        # Multiple IO consumers so concurrent requests' page transfers overlap
+        # (a single aux thread serializes all L3 reads through one CPU).
+        n_aux = int(os.environ.get("SGLANG_HICACHE_AUX_THREADS", "2"))
+        self.prefetch_io_aux_threads = [
+            threading.Thread(target=self.prefetch_io_aux_func, daemon=True)
+            for _ in range(n_aux)
+        ]
+        for t in self.prefetch_io_aux_threads:
+            t.start()
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
