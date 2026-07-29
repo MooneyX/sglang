@@ -2312,18 +2312,19 @@ class Scheduler(
                     prefix_keys,
                 )
 
-    def _race_step(self, req: Req):
+    def _race_step(self, req: Req, allow_trim: bool = True):
         """suffix_race consumption step (tail-first prefetch). Two ways to
         consume the fetched tail:
 
         1. Meeting (cur >= fetched_from): everything beyond cur is fetched;
            copy it and extend the prefix in one shot, then finalize.
-        2. Trim (cur < fetched_from, last chunk): copy the fetched tail now
-           into pending slots, cap the final chunk at fetched_from (see
-           add_chunked_req), terminate the prefetch, and append the pending
-           slots once the compute frontier arrives. This avoids recomputing
-           tail pages that are already fetched when the race would
-           otherwise end before the meeting point.
+        2. Trim (cur < fetched_from, upcoming chunk overlaps the fetched
+           tail): copy the fetched tail into pending slots, cap the chunk
+           at fetched_from (see add_chunked_req), terminate the prefetch,
+           and append the pending slots once the compute frontier arrives.
+           Only allowed in the chunked-req path (allow_trim=True): at
+           admission, add_one_req's extend is not capped by the pending
+           tail, which could double-cover positions.
 
         Must only read consensus-checked state: completed_from_end is
         MIN-reduced across TP ranks before use."""
@@ -2386,7 +2387,8 @@ class Scheduler(
                     return  # retry next round; do not finalize yet
             self._race_finalize(req)
         elif (
-            cfe > 0
+            allow_trim
+            and cfe > 0
             and self.chunked_prefill_size is not None
             and cur < fetched_from <= cur + self.chunked_prefill_size
             and fetch_end - fetched_from >= 64
@@ -3118,7 +3120,9 @@ class Scheduler(
                 # Consume pages the prefetch already delivered (host->device
                 # copy + prefix extension) so the request skips recomputing
                 # them. The batch's hicache_consumer_index syncs the copy.
-                self._race_step(req)
+                # Trim is disabled at admission: add_one_req's extend is not
+                # capped by a pending tail (only add_chunked_req caps).
+                self._race_step(req, allow_trim=False)
                 # Single-chunk requests finish prefill in this batch: any
                 # fetch completing later can never be consumed by them, so
                 # finalize the racing prefetch right away (fetched pages are

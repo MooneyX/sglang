@@ -1006,6 +1006,15 @@ class PrefillAdder:
                     req.retracted_stain,
                 )
             else:
+                # Only one chunked-prefill request may exist at a time (see
+                # the assert in get_new_batch_prefill when adopting
+                # new_chunked_req). Normally the in-flight chunked request
+                # consumes the whole round budget so this path is
+                # unreachable, but the suffix_race tail trim caps a chunked
+                # request's chunk below budget, which can leave budget for a
+                # second truncation -- refuse it and retry next round.
+                if has_chunked_req:
+                    return AddReqResult.OTHER
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
