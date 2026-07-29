@@ -480,8 +480,20 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
-            self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
+            # Budget speculative prefetch at half the host pool by default,
+            # leaving the rest for the write-back staging path. The ratio is
+            # env-tunable: with the default 0.5 and a small host pool, a
+            # single big prefix can already exhaust the budget, collapsing
+            # L3 hit rate under concurrent L3-miss bursts (e.g. 0.5 x 19661
+            # tokens admits only 1x16k or 2x8k in-flight prefetches).
+            capacity_ratio = float(
+                os.environ.get("SGLANG_HICACHE_PREFETCH_CAPACITY_RATIO", "0.5")
+            )
+            self.prefetch_capacity_limit = int(capacity_ratio * self.mem_pool_host.size)
+            logger.info(
+                f"HiCache prefetch capacity limit: {self.prefetch_capacity_limit} tokens "
+                f"(ratio {capacity_ratio}, host pool {self.mem_pool_host.size})"
+            )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
