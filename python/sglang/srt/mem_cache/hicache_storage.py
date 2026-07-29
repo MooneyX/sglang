@@ -370,6 +370,34 @@ class HiCacheFile(HiCacheStorage):
             float(os.environ.get("SGLANG_HICACHE_FILE_READ_DELAY_US", "0")) / 1e6
         )
 
+        # Read-path FD cache: page files are content-addressed and immutable,
+        # so caching open FDs is safe (a deleted-but-open file still yields the
+        # correct content for its key). Avoids one open()+close() syscall pair
+        # per page read; combined with preadv this removes most of the
+        # per-page syscall/Python overhead on the prefetch hot path.
+        self._fd_cache: dict = {}
+        self._fd_cache_limit = 4096
+        self._fd_cache_lock = threading.Lock()
+
+    def _open_cached(self, path: str) -> int:
+        with self._fd_cache_lock:
+            fd = self._fd_cache.get(path)
+            if fd is not None:
+                self._fd_cache[path] = fd  # refresh position (insertion order)
+                self._fd_cache.move_to_end(path)
+                return fd
+        fd = os.open(path, os.O_RDONLY)
+        with self._fd_cache_lock:
+            self._fd_cache[path] = fd
+            self._fd_cache.move_to_end(path)
+            while len(self._fd_cache) > self._fd_cache_limit:
+                _, old_fd = self._fd_cache.popitem(last=False)
+                try:
+                    os.close(old_fd)
+                except OSError:
+                    pass
+        return fd
+
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
@@ -395,10 +423,10 @@ class HiCacheFile(HiCacheStorage):
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
-            with open(tensor_path, "rb", buffering=0) as f:
-                buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
-                if f.readinto(buf) != expected:
-                    raise IOError(f"Short read for {suffixed}")
+            fd = self._open_cached(tensor_path)
+            buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
+            if os.preadv(fd, [buf], 0) != expected:
+                raise IOError(f"Short read for {suffixed}")
             if self._read_delay_s > 0:
                 time.sleep(self._read_delay_s)
             self._evictor.touch(suffixed, tensor_path)
@@ -611,6 +639,15 @@ class HiCacheFile(HiCacheStorage):
 
     def clear(self) -> bool:
         try:
+            # Invalidate the FD cache first so post-clear reads cannot serve
+            # stale content from still-open deleted files.
+            with self._fd_cache_lock:
+                for fd in self._fd_cache.values():
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                self._fd_cache.clear()
             for filename in os.listdir(self.file_path):
                 file_path = os.path.join(self.file_path, filename)
                 if os.path.isfile(file_path):
