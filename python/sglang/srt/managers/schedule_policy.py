@@ -724,7 +724,20 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        truncated = cand_extend_input_len > _rem_tokens
+        # suffix_race tail trim: a fetched tail is pending consumption in
+        # req.race_tail_slots. Cap this chunk at the tail start so the
+        # request skips recomputing fetched pages, and keep it in chunked
+        # state until the tail is appended to its prefix — otherwise it
+        # would transition to decode with an incomplete prefix.
+        race_tail_start = getattr(req, "race_tail_start", None)
+        force_chunked = False
+        if race_tail_start is not None:
+            cand_extend_input_len = min(
+                cand_extend_input_len,
+                max(0, race_tail_start - len(req.prefix_indices)),
+            )
+            force_chunked = True
+        truncated = cand_extend_input_len > _rem_tokens or force_chunked
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
