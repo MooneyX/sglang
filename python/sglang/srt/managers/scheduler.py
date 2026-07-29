@@ -2362,15 +2362,14 @@ class Scheduler(
                 tc.race_unregister_load_ack(ack_id, last_host_node)
                 logger.info(f"[RaceConsume] rid={req.rid} LOAD_FAILED n={n}")
         # Resolve the race: fully fetched and fully consumed, or the GPU
-        # caught up while the prefetch was still waiting in queue (further
-        # fetching would only duplicate the GPU's own compute).
-        # NOTE: `started` must be derived from consensus values only
-        # (target is set after an all-reduced hit query; done is MIN-reduced
-        # above) -- raw op.completed_tokens may diverge across ranks.
+        # frontier has moved past the fetch start while the prefetch is
+        # still queued (further fetching would only duplicate the GPU's own
+        # compute). At cur == fetch_start the race has simply not begun yet,
+        # so "not started" alone must NOT trigger a give-up.
         fully_fetched = target > 0 and done >= target
         started = target > 0 or done > 0
         if cur >= fetched_end:
-            if fully_fetched or not started:
+            if fully_fetched or (not started and cur > req.race_fetch_start):
                 self._race_finalize(req)
 
     def _race_finalize(self, req: Req):
@@ -2379,11 +2378,13 @@ class Scheduler(
         emit the final measurement line."""
         tc = self.tree_cache
         if req.rid in tc.ongoing_prefetch:
-            op = tc.ongoing_prefetch[req.rid][3]
-            target = len(op.hash_value) * tc.page_size if op.hash_value else 0
-            if op.completed_tokens < target:
-                tc.terminate_prefetch(req.rid)
+            # Always mark terminate: with a pending hit query (target == 0)
+            # `completed < target` would be False and the op would leak and
+            # keep fetching unconsumable pages.
+            tc.terminate_prefetch(req.rid)
             tc.check_prefetch_progress(req.rid)
+        elif getattr(req, "race_fetch_start", None) is None:
+            return
         req.race_fetch_start = None
         m = (
             tc.pop_prefetch_measure(req.rid)
