@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -363,6 +364,12 @@ class HiCacheFile(HiCacheStorage):
             extra_config=storage_config.extra_config,
         )
 
+        # Experiment knob: artificial per-page read delay (microseconds) to
+        # emulate slow storage (e.g. remote / cold disk). 0 = disabled.
+        self._read_delay_s = (
+            float(os.environ.get("SGLANG_HICACHE_FILE_READ_DELAY_US", "0")) / 1e6
+        )
+
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
@@ -392,6 +399,8 @@ class HiCacheFile(HiCacheStorage):
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
                 if f.readinto(buf) != expected:
                     raise IOError(f"Short read for {suffixed}")
+            if self._read_delay_s > 0:
+                time.sleep(self._read_delay_s)
             self._evictor.touch(suffixed, tensor_path)
             return target_location
         except FileNotFoundError:
