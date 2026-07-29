@@ -2342,6 +2342,10 @@ class Scheduler(
         cur = len(req.prefix_indices)
         fetched_end = req.race_fetch_start + done
         n = fetched_end - cur
+        logger.info(
+            f"[RaceStep] rid={req.rid} done={done} target={target} "
+            f"cur={cur} fetch_start={req.race_fetch_start} n={n}"
+        )
         if n > 0:
             off = cur - req.race_fetch_start
             ack_id = tc.race_register_load_ack(last_host_node)
@@ -2353,8 +2357,10 @@ class Scheduler(
                     [req.prefix_indices, device_indices]
                 )
                 cur += n
+                logger.info(f"[RaceConsume] rid={req.rid} n={n}")
             else:
                 tc.race_unregister_load_ack(ack_id, last_host_node)
+                logger.info(f"[RaceConsume] rid={req.rid} LOAD_FAILED n={n}")
         # Resolve the race: fully fetched and fully consumed, or the GPU
         # caught up while the prefetch was still waiting in queue (further
         # fetching would only duplicate the GPU's own compute).
