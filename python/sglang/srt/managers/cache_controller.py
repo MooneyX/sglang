@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Queue
@@ -923,12 +924,38 @@ class HiCacheController:
         for page in pages:
             self.host_mem_release_queue.put(page)
 
+    def _current_read_delay(self) -> float:
+        """Runtime L3 bandwidth knob for zero-copy backends (mooncake etc.):
+        same control file as the HiCacheFile delay knob, re-read on mtime
+        change. Missing/invalid file means no artificial delay."""
+        if not hasattr(self, "_delay_file"):
+            self._delay_file = os.environ.get(
+                "SGLANG_HICACHE_FILE_READ_DELAY_FILE",
+                "/tmp/hicache_read_delay_us",
+            )
+            self._delay_file_mtime = -1.0
+            self._read_delay_s = 0.0
+        try:
+            st = os.stat(self._delay_file)
+            if st.st_mtime != self._delay_file_mtime:
+                self._delay_file_mtime = st.st_mtime
+                with open(self._delay_file) as f:
+                    self._read_delay_s = float(f.read().strip()) / 1e6
+        except (OSError, ValueError):
+            pass  # keep the last known value
+        return self._read_delay_s
+
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ):
         results = self.storage_backend.batch_get_v1(
             hash_values, host_indices, extra_info
         )
+        delay = self._current_read_delay()
+        if delay > 0:
+            # Emulate slow L3 on zero-copy backends: pro-rate the per-page
+            # delay over this batch.
+            time.sleep(delay * len(hash_values))
         inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
