@@ -2314,19 +2314,6 @@ class Scheduler(
                         len(self.waiting_queue) == 0
                         and race_wait_est < tc.est_recompute_time(x) * 0.8
                     )
-                    cc = tc.cache_controller
-                    pfq = cc.prefetch_queue.qsize() + (
-                        cc.prefetch_buffer.qsize()
-                        if getattr(cc, "prefetch_buffer", None) is not None
-                        else 0
-                    )
-                    logger.info(
-                        f"[RaceVote] rid={req.rid} wait_qlen={len(self.waiting_queue)} "
-                        f"pf_q={pfq} wait_est={race_wait_est:.3f} "
-                        f"thr={tc.est_recompute_time(x) * 0.5:.3f} "
-                        f"floor={tc.pf_token_time_floor} "
-                        f"op_ewma={tc.pf_op_time_ewma} vote={vote}"
-                    )
                     t = torch.tensor([vote], dtype=torch.int)
                     tc._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN)
                     if t.item() == 1:
