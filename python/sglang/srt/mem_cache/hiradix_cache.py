@@ -192,6 +192,13 @@ class HiRadixCache(RadixCache):
         # time, used to estimate prefetch queue wait for race decisions.
         self.pf_op_time_ewma: Optional[float] = None
         self.pf_token_time_ewma: Optional[float] = None
+        # Floor of per-token fetch time: approximates the UNCONTENDED rate
+        # (fetch running while the GPU is idle -- exactly the wait-mode
+        # scenario). Race-mode fetches under compute contention are 2-3x
+        # slower and would otherwise poison the EWMA and lock the wait
+        # decision out forever. Decays upward slowly (x1.1 per op) so a
+        # genuinely slower backend can raise the floor.
+        self.pf_token_time_floor: Optional[float] = None
         self._load_race_config(server_args)
         # Synthetic ack ids for race consumption loads (negative to avoid
         # collision with real TreeNode ids)
@@ -234,14 +241,18 @@ class HiRadixCache(RadixCache):
 
     def est_prefetch_wait(self, num_tokens: int) -> float:
         """Estimated wall time (seconds) for a prefetch of num_tokens issued
-        now, including queueing behind pending prefetch tasks."""
+        now, including queueing behind pending prefetch tasks. The per-token
+        rate uses the uncontended floor (wait-mode fetches run on an idle
+        GPU), not the contention-polluted EWMA."""
         cc = self.cache_controller
         q = cc.prefetch_queue.qsize()
         buf = getattr(cc, "prefetch_buffer", None)
         if buf is not None:
             q += buf.qsize()
         op_time = self.pf_op_time_ewma if self.pf_op_time_ewma else 0.5
-        token_time = self.pf_token_time_ewma if self.pf_token_time_ewma else 48e-6
+        token_time = (
+            self.pf_token_time_floor if self.pf_token_time_floor else 48e-6
+        )
         return q * op_time + num_tokens * token_time
 
     def prefetch_incomplete(self, req_id: str) -> bool:
@@ -313,6 +324,11 @@ class HiRadixCache(RadixCache):
                 self.pf_token_time_ewma = tt
             else:
                 self.pf_token_time_ewma = 0.8 * self.pf_token_time_ewma + 0.2 * tt
+            # Uncontended-rate floor: drop fast, rise slowly.
+            if self.pf_token_time_floor is None:
+                self.pf_token_time_floor = tt
+            else:
+                self.pf_token_time_floor = min(tt, self.pf_token_time_floor * 1.1)
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
