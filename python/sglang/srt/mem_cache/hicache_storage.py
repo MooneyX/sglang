@@ -378,6 +378,15 @@ class HiCacheFile(HiCacheStorage):
         )
         self._delay_file_mtime: float = -1.0
 
+        # Read-path FD cache: page files are content-addressed and immutable,
+        # so caching open FDs is safe (a deleted-but-open file still yields the
+        # correct content for its key). Avoids one open()+close() syscall pair
+        # per page read; combined with preadv this removes most of the
+        # per-page syscall/Python overhead on the prefetch hot path.
+        self._fd_cache = collections.OrderedDict()
+        self._fd_cache_limit = 4096
+        self._fd_cache_lock = threading.Lock()
+
     def _current_read_delay(self) -> float:
         try:
             st = os.stat(self._delay_file)
@@ -388,15 +397,6 @@ class HiCacheFile(HiCacheStorage):
         except (OSError, ValueError):
             pass  # keep the last known value (or env default if never set)
         return self._read_delay_s
-
-        # Read-path FD cache: page files are content-addressed and immutable,
-        # so caching open FDs is safe (a deleted-but-open file still yields the
-        # correct content for its key). Avoids one open()+close() syscall pair
-        # per page read; combined with preadv this removes most of the
-        # per-page syscall/Python overhead on the prefetch hot path.
-        self._fd_cache = collections.OrderedDict()
-        self._fd_cache_limit = 4096
-        self._fd_cache_lock = threading.Lock()
 
     def _open_cached(self, path: str) -> int:
         with self._fd_cache_lock:
