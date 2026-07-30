@@ -370,6 +370,24 @@ class HiCacheFile(HiCacheStorage):
         self._read_delay_s = (
             float(os.environ.get("SGLANG_HICACHE_FILE_READ_DELAY_US", "0")) / 1e6
         )
+        # Runtime-adjustable delay: if this control file exists, its content
+        # (microseconds) overrides the env value, letting experiments vary
+        # L3 bandwidth without a server restart. Re-read on mtime change.
+        self._delay_file = os.environ.get(
+            "SGLANG_HICACHE_FILE_READ_DELAY_FILE", "/tmp/hicache_read_delay_us"
+        )
+        self._delay_file_mtime: float = -1.0
+
+    def _current_read_delay(self) -> float:
+        try:
+            st = os.stat(self._delay_file)
+            if st.st_mtime != self._delay_file_mtime:
+                self._delay_file_mtime = st.st_mtime
+                with open(self._delay_file) as f:
+                    self._read_delay_s = float(f.read().strip()) / 1e6
+        except (OSError, ValueError):
+            pass  # keep the last known value (or env default if never set)
+        return self._read_delay_s
 
         # Read-path FD cache: page files are content-addressed and immutable,
         # so caching open FDs is safe (a deleted-but-open file still yields the
@@ -427,8 +445,9 @@ class HiCacheFile(HiCacheStorage):
             buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
             if os.preadv(fd, [buf], 0) != expected:
                 raise IOError(f"Short read for {suffixed}")
-            if self._read_delay_s > 0:
-                time.sleep(self._read_delay_s)
+            delay = self._current_read_delay()
+            if delay > 0:
+                time.sleep(delay)
             self._evictor.touch(suffixed, tensor_path)
             return target_location
         except FileNotFoundError:

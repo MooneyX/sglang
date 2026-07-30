@@ -339,6 +339,15 @@ class HiRadixCache(RadixCache):
                     self.pf_token_time_floor = min(
                         tt, self.pf_token_time_floor * 1.1
                     )
+            elif (
+                self.pf_token_time_floor is None
+                or tt < self.pf_token_time_floor
+            ):
+                # Reverse (racing) samples are contention-inflated UPPER
+                # bounds on the idle rate: a fast one proves the idle rate
+                # is at most tt, so it may LOWER the floor (bandwidth
+                # recovery) but never raise it (contention artifact).
+                self.pf_token_time_floor = tt
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
