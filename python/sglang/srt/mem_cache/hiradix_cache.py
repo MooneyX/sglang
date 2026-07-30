@@ -1701,6 +1701,7 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        reverse: Optional[bool] = None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,
@@ -1737,13 +1738,18 @@ class HiRadixCache(RadixCache):
                 last_host_node.release_host()
                 # no sufficient host memory for prefetch
                 return
+        if reverse is None:
+            # Default: suffix_race fetches tail-first (consumed at the chunk
+            # meeting point); all other policies fetch head-first (consumed
+            # via the contiguous tree-insert path).
+            reverse = self.prefetch_stop_policy == "suffix_race"
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
             prefetch_key,
             last_hash,
             prefix_keys,
-            reverse=(self.prefetch_stop_policy == "suffix_race"),
+            reverse=reverse,
             **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (

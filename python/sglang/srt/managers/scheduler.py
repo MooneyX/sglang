@@ -2336,6 +2336,11 @@ class Scheduler(
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
+                    # Wait-mode requests consume through the stock
+                    # contiguous tree-insert path, so their prefetch must
+                    # fetch head-first (completed_tokens semantics), not
+                    # tail-first like racing requests.
+                    reverse=(False if getattr(req, "race_wait", False) else None),
                 )
                 if getattr(req, "race_wait", False):
                     # Safety valve for wait-mode: if the fetch runs far past
