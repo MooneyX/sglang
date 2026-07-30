@@ -2299,22 +2299,19 @@ class Scheduler(
                     # boundaries). Switch to wait-mode (behave like
                     # wait_complete for this request) only when the GPU is
                     # idle AND fetching the whole prefix is clearly cheaper
-                    # than computing even the first chunk -- in that regime
-                    # the first chunk would be wasted work that the prefetch
-                    # already delivers. Any doubt -> race (robust default).
+                    # than recomputing it (i* < 0 regime): there the race's
+                    # boundary-sync / copy / GIL-contention overhead exceeds
+                    # any overlap gain. Empirically the wait/race boundary
+                    # sits at wait_est ~= 0.5 * recompute_est across all
+                    # backends we measured (file fast/slow, mooncake
+                    # TCP/RDMA). Any doubt -> race (robust default).
                     # MIN vote: all TP ranks must agree on the switch.
                     tc = self.tree_cache
                     x = len(new_input_tokens)
                     race_wait_est = tc.est_prefetch_wait(x)
-                    chunk_len = (
-                        min(x, self.chunked_prefill_size)
-                        if self.chunked_prefill_size
-                        else x
-                    )
-                    chunk_est = tc.est_recompute_time(chunk_len)
                     vote = int(
                         len(self.waiting_queue) == 0
-                        and race_wait_est < chunk_est * 0.8
+                        and race_wait_est < tc.est_recompute_time(x) * 0.5
                     )
                     t = torch.tensor([vote], dtype=torch.int)
                     tc._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN)
