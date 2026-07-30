@@ -1778,6 +1778,9 @@ class HiRadixCache(RadixCache):
             last_hash,
             prefix_keys,
             reverse=reverse,
+            # suffix_race ops (both directions) use the optimistic path --
+            # the hit query costs 0.3-0.5s per op on the file backend.
+            skip_hit_query=(self.prefetch_stop_policy == "suffix_race"),
             **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (

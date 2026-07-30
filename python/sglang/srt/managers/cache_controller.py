@@ -183,6 +183,7 @@ class PrefetchOperation(StorageOperation):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         reverse: bool = False,
+        skip_hit_query: bool = False,
     ):
         self.request_id = request_id
         # reverse=True (suffix_race): fetch pages from the tail backward,
@@ -190,6 +191,10 @@ class PrefetchOperation(StorageOperation):
         # completed_from_end instead of completed_tokens.
         self.reverse = reverse
         self.completed_from_end = 0
+        # skip_hit_query=True (suffix_race wait-mode, forward): also use the
+        # optimistic path (no storage hit query) but keep head-first
+        # completed_tokens semantics.
+        self.skip_hit_query = skip_hit_query
 
         self._lock = threading.Lock()
         self._terminated_flag = False
@@ -893,13 +898,14 @@ class HiCacheController:
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         reverse: bool = False,
+        skip_hit_query: bool = False,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys,
-            reverse=reverse,
+            reverse=reverse, skip_hit_query=skip_hit_query,
         )
         # Record prefetch-queue depth at task arrival for observability
         operation.arrival_qdepth = self.prefetch_queue.qsize()
@@ -1094,11 +1100,15 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                if operation.reverse:
+                if operation.reverse or getattr(
+                    operation, "skip_hit_query", False
+                ):
                     # suffix_race optimistic fetch: skip the hit query
                     # entirely (it is the dominant startup latency), just
                     # compute the page hash chain and start fetching. Pages
                     # missing from storage truncate the fetch naturally.
+                    # Used by both tail-first (race) and head-first
+                    # (wait-mode) operations under the suffix_race policy.
                     hash_value = []
                     last_hash = operation.last_hash
                     tokens_to_fetch = operation.token_ids
