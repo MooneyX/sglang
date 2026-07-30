@@ -2289,15 +2289,41 @@ class Scheduler(
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
 
+                race_wait_est = 0.0
                 if (
                     self.server_args.hicache_storage_prefetch_policy
                     == "suffix_race"
                 ):
-                    # Pure race: always issue the prefetch. No queue-length
-                    # estimates -- GPU recompute (head-first) and the prefetch
-                    # race forward, and the meeting point is resolved
-                    # physically during chunked prefill (see _race_step).
-                    req.race_fetch_start = matched_len
+                    # Per-request mode selection. Default is the pure race
+                    # (admit immediately, resolve the meeting point at chunk
+                    # boundaries). Switch to wait-mode (behave like
+                    # wait_complete for this request) only when the GPU is
+                    # idle AND fetching the whole prefix is clearly cheaper
+                    # than computing even the first chunk -- in that regime
+                    # the first chunk would be wasted work that the prefetch
+                    # already delivers. Any doubt -> race (robust default).
+                    # MIN vote: all TP ranks must agree on the switch.
+                    tc = self.tree_cache
+                    x = len(new_input_tokens)
+                    race_wait_est = tc.est_prefetch_wait(x)
+                    chunk_len = (
+                        min(x, self.chunked_prefill_size)
+                        if self.chunked_prefill_size
+                        else x
+                    )
+                    chunk_est = tc.est_recompute_time(chunk_len)
+                    vote = int(
+                        len(self.waiting_queue) == 0
+                        and race_wait_est < chunk_est * 0.8
+                    )
+                    t = torch.tensor([vote], dtype=torch.int)
+                    tc._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN)
+                    if t.item() == 1:
+                        req.race_wait = True
+                        req.race_fetch_start = None
+                    else:
+                        req.race_wait = False
+                        req.race_fetch_start = matched_len
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
@@ -2311,6 +2337,16 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
+                if getattr(req, "race_wait", False):
+                    # Safety valve for wait-mode: if the fetch runs far past
+                    # the estimate (pool eviction, cold miss), terminate via
+                    # the TP-consensus path (can_terminate_prefetch) and
+                    # recompute instead of waiting forever.
+                    info = self.tree_cache.ongoing_prefetch.get(req.rid)
+                    if info is not None:
+                        info[3].race_expire_perf = (
+                            time.perf_counter() + race_wait_est * 2.0
+                        )
 
     def _race_step(self, req: Req, allow_trim: bool = True):
         """suffix_race consumption step (tail-first prefetch). Two ways to
@@ -3040,7 +3076,10 @@ class Scheduler(
                     self.server_args.hicache_storage_prefetch_policy
                     == "suffix_race"
                 )
-                if race_mode:
+                # Wait-mode requests (selected at arrival) skip the race and
+                # use the stock wait_complete-style gating in the else branch.
+                race_wait = race_mode and getattr(req, "race_wait", False)
+                if race_mode and not race_wait:
                     # Race: admit immediately. The prefetch keeps running and
                     # is consumed incrementally by _race_step during chunked
                     # prefill; finalization happens in _race_finalize.
@@ -3057,6 +3096,7 @@ class Scheduler(
                     )
                     logger.info(
                         f"[PrefetchMeasure] rid={req.rid} "
+                        f"mode=race "
                         f"arrival_qlen={getattr(req, 'arrival_queue_len', -1)} "
                         f"device_hit={len(req.prefix_indices)} "
                         f"host_hit={getattr(req, 'host_hit_length', 0)} "
@@ -3074,6 +3114,11 @@ class Scheduler(
                     # ranks via all-reduce. Do NOT branch on wall-clock
                     # deadlines here -- divergent branches across ranks would
                     # deadlock collectives.
+                    mode_str = (
+                        "wait"
+                        if race_wait
+                        else self.server_args.hicache_storage_prefetch_policy
+                    )
                     prefetch_done = self.tree_cache.check_prefetch_progress(
                         req.rid
                     )
@@ -3107,6 +3152,7 @@ class Scheduler(
                     )
                     logger.info(
                         f"[PrefetchMeasure] rid={req.rid} "
+                        f"mode={mode_str} "
                         f"arrival_qlen={getattr(req, 'arrival_queue_len', -1)} "
                         f"device_hit={len(req.prefix_indices)} "
                         f"host_hit={getattr(req, 'host_hit_length', 0)} "
