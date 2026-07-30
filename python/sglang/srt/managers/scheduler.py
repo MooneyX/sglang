@@ -2302,16 +2302,17 @@ class Scheduler(
                     # than recomputing it (i* < 0 regime): there the race's
                     # boundary-sync / copy / GIL-contention overhead exceeds
                     # any overlap gain. Empirically the wait/race boundary
-                    # sits at wait_est ~= 0.5 * recompute_est across all
-                    # backends we measured (file fast/slow, mooncake
-                    # TCP/RDMA). Any doubt -> race (robust default).
-                    # MIN vote: all TP ranks must agree on the switch.
+                    # sits at wait_est ~= 0.8 * recompute_est across all
+                    # backends and lengths we measured (file fast/slow,
+                    # mooncake TCP/RDMA; 8K-64K). Any doubt -> race (robust
+                    # default). MIN vote: all TP ranks must agree on the
+                    # switch.
                     tc = self.tree_cache
                     x = len(new_input_tokens)
                     race_wait_est = tc.est_prefetch_wait(x)
                     vote = int(
                         len(self.waiting_queue) == 0
-                        and race_wait_est < tc.est_recompute_time(x) * 0.5
+                        and race_wait_est < tc.est_recompute_time(x) * 0.8
                     )
                     cc = tc.cache_controller
                     pfq = cc.prefetch_queue.qsize() + (
