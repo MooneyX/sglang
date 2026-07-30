@@ -304,14 +304,16 @@ class HiRadixCache(RadixCache):
         # may still be in flight this pass.
         self.cache_controller.append_host_mem_release(host_indices)
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
-        self._update_pf_ewma(dur, cfe)
+        self._update_pf_ewma(dur, cfe, reverse=True)
         return {
             "prefetch_len": len(prefetch_key),
             "completed_tokens": cfe,
             "prefetch_dur": dur,
         }
 
-    def _update_pf_ewma(self, op_duration: float, completed_tokens: int):
+    def _update_pf_ewma(
+        self, op_duration: float, completed_tokens: int, reverse: bool = False
+    ):
         if op_duration <= 0:
             return
         if self.pf_op_time_ewma is None:
@@ -324,11 +326,19 @@ class HiRadixCache(RadixCache):
                 self.pf_token_time_ewma = tt
             else:
                 self.pf_token_time_ewma = 0.8 * self.pf_token_time_ewma + 0.2 * tt
-            # Uncontended-rate floor: drop fast, rise slowly.
-            if self.pf_token_time_floor is None:
-                self.pf_token_time_floor = tt
-            else:
-                self.pf_token_time_floor = min(tt, self.pf_token_time_floor * 1.1)
+            # Uncontended-rate floor: drop fast, rise slowly. Only learned
+            # from forward (non-reverse) ops -- wait-mode / wait_complete
+            # fetches run while the request waits (near-idle GPU), while
+            # reverse race-mode fetches always overlap compute and are
+            # 2-3x slower; letting the latter set the floor locks the wait
+            # decision out forever.
+            if not reverse:
+                if self.pf_token_time_floor is None:
+                    self.pf_token_time_floor = tt
+                else:
+                    self.pf_token_time_floor = min(
+                        tt, self.pf_token_time_floor * 1.1
+                    )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -1634,7 +1644,9 @@ class HiRadixCache(RadixCache):
 
         # Record prefetch measurement for observability (issue -> complete)
         op_dur = time.monotonic() - operation.start_time
-        self._update_pf_ewma(op_dur, min_completed_tokens)
+        self._update_pf_ewma(
+            op_dur, min_completed_tokens, reverse=operation.reverse
+        )
         self.prefetch_measure_by_reqid[req_id] = {
             "prefetch_len": len(prefetch_key),
             "completed_tokens": min_completed_tokens,
