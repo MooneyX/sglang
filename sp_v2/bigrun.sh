@@ -151,22 +151,22 @@ module_A(){
     run_probe "rdma_${pol}" 32
     run_sweep "rdma_${pol}" "16384,32768,49152,65536" 8
   done
-  if [ "$PAGE" -gt 1 ]; then
-    # page>1: delay knob is a per-page sleep, so 100us no longer emulates a
-    # slow disk (page=16 -> ~7.6GB/s equivalent). Run file0 only; slow-disk
-    # semantics need delay*PAGE and are covered by a dedicated run.
-    log "PAGE=$PAGE: skipping file delay=100 cells (delay semantics changed, see PAGE16_TEST_PLAN)"
-  else
-    for delay in 0 100; do
-      for pol in wait_complete suffix_race; do
-        start_server file "$pol" "$delay" yes
-        wait_healthy
-        check_page
-        run_probe "file${delay}_${pol}" 24
-        run_sweep "file${delay}_${pol}" "16384,32768,65536" 6
-      done
+  for delay in 0 100; do
+    if [ "$PAGE" -gt 1 ] && [ "$delay" -gt 0 ]; then
+      # page>1: delay knob is a per-page sleep, so 100us no longer emulates a
+      # slow disk (page=16 -> ~7.6GB/s equivalent). Keep file0 (delay=0);
+      # slow-disk semantics need delay*PAGE and are covered by a dedicated run.
+      log "PAGE=$PAGE: skipping file delay=100 cells (delay semantics changed, see PAGE16_TEST_PLAN)"
+      continue
+    fi
+    for pol in wait_complete suffix_race; do
+      start_server file "$pol" "$delay" yes
+      wait_healthy
+      check_page
+      run_probe "file${delay}_${pol}" 24
+      run_sweep "file${delay}_${pol}" "16384,32768,65536" 6
     done
-  fi
+  done
   start_server file best_effort 0 yes
   wait_healthy
   check_page
