@@ -443,6 +443,10 @@ class Envs:
     MOONCAKE_PROTOCOL = EnvStr("rdma")
     MOONCAKE_DEVICE = EnvStr("")
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
+    # Max pages per batched storage IO call (default matches legacy constant).
+    # Larger batches amortize per-call transfer-engine overhead; sweep this
+    # 128->256/512/1024 to approach RDMA line speed on mooncake backend.
+    SGLANG_HICACHE_STORAGE_BATCH_SIZE = EnvInt(128)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)

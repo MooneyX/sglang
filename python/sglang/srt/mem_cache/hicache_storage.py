@@ -21,7 +21,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
-STORAGE_BATCH_SIZE = 128
+# Parameterized via SGLANG_HICACHE_STORAGE_BATCH_SIZE (default 128) so the
+# batch granularity can be swept without code edits (P0-3: 128->512/1024
+# amortizes transfer-engine per-call overhead toward RDMA line speed).
+STORAGE_BATCH_SIZE = envs.SGLANG_HICACHE_STORAGE_BATCH_SIZE.get()
 
 
 @dataclass
