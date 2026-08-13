@@ -81,9 +81,11 @@ case "${ROLE:-}" in
     log "store_service pid $(pgrep -f mooncake_store_service | head -1)"
     ;;
   sglang)
-    # inference server: hicache mooncake backend, P2PHANDSHAKE to the same master
-    log "starting sglang hicache mooncake (master=${M1_IP}:${MASTER_PORT}, dev=${DEV})"
-    MC_MASTER="${M1_IP}:${MASTER_PORT}" MC_SEG="${SEG}" PAGE=${PAGE:-16} \
+    # inference server: hicache mooncake backend, P2PHANDSHAKE to the same master.
+    # MC_HOST must be THIS host's RDMA-reachable IP (cross-host 29.x here, NOT bond2).
+    log "starting sglang hicache mooncake (master=${M1_IP}:${MASTER_PORT}, dev=${DEV}, host=${SGLANG_HOST:-${M1_IP}})"
+    MC_MASTER="${M1_IP}:${MASTER_PORT}" MC_SEG="${SEG}" \
+    MC_DEV="${DEV:-mlx5_bond_1}" MC_HOST="${SGLANG_HOST:-${M1_IP}}" PAGE=${PAGE:-16} \
     bash "${WORK}/start_dsv3.sh" 31000 storev 0.90 8192 wait_complete 0 0 mooncake
     ;;
   write)
