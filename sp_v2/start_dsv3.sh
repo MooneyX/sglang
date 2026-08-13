@@ -9,6 +9,9 @@
 #       storage batch (128 pages * PAGE * 70KB for MLA) -> higher L3 bandwidth.
 #       NOTE: changing PAGE invalidates the on-disk hash layout -> clean storage
 #       dir first (bigrun.sh does this via clean=yes).
+# MC_DEV: RDMA device name for mooncake backend (env, default mlx5_bond_1).
+#       Cross-host setups may need per-host devices (e.g. 88: mlx5_9, 104: mlx5_bond_0).
+# MC_HOST: local hostname/IP for mooncake (env; default auto-detect bond2).
 PORT=${1:-31000}
 TAG=${2:-v2}
 MEMFRAC=${3:-0.90}
@@ -18,6 +21,7 @@ CGBS=${6:-0}
 DELAY_US=${7:-0}
 BACKEND=${8:-file}
 PAGE=${PAGE:-1}
+MC_DEV=${MC_DEV:-mlx5_bond_1}
 LOG=/tmp/sp_server_${TAG}.log
 if [ "${CGBS}" -gt 0 ]; then
   GRAPH_FLAG="--cuda-graph-max-bs-decode ${CGBS}"
@@ -35,7 +39,7 @@ if [ "${BACKEND}" = "mooncake" ]; then
     MC_HOST=$(ifconfig bond2 2>/dev/null | grep -oE 'inet [0-9.]+' | awk '{print $2}')
   fi
   if [ "${MC_PROTO}" = "rdma" ]; then
-    EXTRA_CFG="{\"master_server_address\":\"${MC_MASTER}\",\"local_hostname\":\"${MC_HOST}\",\"protocol\":\"rdma\",\"device_name\":\"mlx5_bond_1\",\"global_segment_size\":\"${MC_SEG}\",\"prefetch_threshold\":64}"
+    EXTRA_CFG="{\"master_server_address\":\"${MC_MASTER}\",\"local_hostname\":\"${MC_HOST}\",\"protocol\":\"rdma\",\"device_name\":\"${MC_DEV}\",\"global_segment_size\":\"${MC_SEG}\",\"prefetch_threshold\":64}"
   else
     EXTRA_CFG="{\"master_server_address\":\"${MC_MASTER}\",\"local_hostname\":\"127.0.0.1\",\"protocol\":\"tcp\",\"global_segment_size\":\"${MC_SEG}\",\"prefetch_threshold\":64}"
   fi
