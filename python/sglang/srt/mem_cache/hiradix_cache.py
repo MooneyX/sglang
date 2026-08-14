@@ -244,6 +244,10 @@ class HiRadixCache(RadixCache):
         if tokens <= 0 or seconds <= 0:
             return
         rate = seconds / tokens * 1e6  # us/token
+        # Outlier guard: a stale/queued timing delta would poison the EWMA.
+        # Sanity window 5..2000 us/token (0.005..2 ms/token).
+        if not (5.0 <= rate <= 2000.0):
+            return
         if self.race_recompute_a_us_auto is None:
             self.race_recompute_a_us_auto = rate
         else:

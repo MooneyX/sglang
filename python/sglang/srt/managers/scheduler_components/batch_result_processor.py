@@ -225,15 +225,21 @@ class SchedulerBatchResultProcessor:
                     continue
 
                 if req.inflight_middle_chunks <= 0:
+                    first_prefill_done = (
+                        req.time_stats.prefill_finished_time == 0.0
+                    )
                     req.time_stats.set_prefill_finished_time()
 
                     # Calibrate the race recompute cost model from a pure
                     # recompute (L3-miss) prefill so mode-switch decisions
-                    # track the actual GPU prefill speed. Skip racing requests
+                    # track the actual GPU prefill speed. Only on the FIRST
+                    # prefill completion (decode iterations would otherwise
+                    # re-trigger with a stale delta), and skip racing requests
                     # (race_t0 set): their prefill mixes L3 consumption and
                     # would pollute the rate.
                     if (
-                        getattr(req, "storage_hit_length", 1) == 0
+                        first_prefill_done
+                        and getattr(req, "storage_hit_length", 1) == 0
                         and len(req.full_untruncated_fill_ids) > 0
                         and getattr(req, "race_t0", None) is None
                     ):
