@@ -2445,7 +2445,15 @@ class Scheduler(
             allow_trim
             and cfe > 0
             and self.chunked_prefill_size is not None
-            and cur < fetched_from <= cur + self.chunked_prefill_size
+            and cur < fetched_from
+            and (
+                fetched_from <= cur + self.chunked_prefill_size
+                or cfe >= total
+                # Prefetch fully done: trim immediately so the host->device
+                # tail copy overlaps the remaining GPU recompute instead of
+                # stalling at the boundary (a ~7000-token copy is ~80ms and
+                # would otherwise be exposed after the frontier arrives).
+            )
             and fetch_end - fetched_from >= 64
             and not self.waiting_queue
         ):
