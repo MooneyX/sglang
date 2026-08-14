@@ -188,6 +188,10 @@ class HiRadixCache(RadixCache):
         # race_recompute_a_us / race_recompute_b_us.
         self.race_recompute_a_us = 79.5
         self.race_recompute_b_us = 5.33e-3
+        # Runtime-calibrated recompute rate (us/token), updated from real
+        # L3-miss prefills so mode-switch decisions track the actual GPU
+        # prefill speed instead of the DS-V3 default constants.
+        self.race_recompute_a_us_auto: Optional[float] = None
         # EWMA of full prefetch op wall time (queue+exec) and per-token fetch
         # time, used to estimate prefetch queue wait for race decisions.
         self.pf_op_time_ewma: Optional[float] = None
@@ -233,9 +237,32 @@ class HiRadixCache(RadixCache):
         except Exception:
             pass
 
+    def calibrate_recompute_rate(self, tokens: int, seconds: float):
+        """Calibrate the recompute cost model from a completed pure-recompute
+        (L3-miss) prefill. Once calibrated, est_recompute_time uses the
+        measured linear rate (dense-style) instead of the DS-V3 constants."""
+        if tokens <= 0 or seconds <= 0:
+            return
+        rate = seconds / tokens * 1e6  # us/token
+        if self.race_recompute_a_us_auto is None:
+            self.race_recompute_a_us_auto = rate
+        else:
+            # EWMA (alpha 0.2) to smooth per-request variance.
+            self.race_recompute_a_us_auto = (
+                0.8 * self.race_recompute_a_us_auto + 0.2 * rate
+            )
+
     def est_recompute_time(self, num_tokens: int) -> float:
         """Estimated GPU recompute time (seconds) for num_tokens of KV."""
-        a = self.race_recompute_a_us * 1e-6
+        a_us = (
+            self.race_recompute_a_us_auto
+            if self.race_recompute_a_us_auto is not None
+            else self.race_recompute_a_us
+        )
+        a = a_us * 1e-6
+        if self.race_recompute_a_us_auto is not None:
+            # Runtime-calibrated: dense-style linear recompute model.
+            return a * num_tokens
         b = self.race_recompute_b_us * 1e-6
         return a * num_tokens + 0.5 * b * num_tokens * num_tokens
 

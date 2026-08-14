@@ -2331,6 +2331,7 @@ class Scheduler(
                     else:
                         req.race_wait = False
                         req.race_fetch_start = matched_len
+                        req.race_t0 = time.perf_counter()
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
@@ -2394,6 +2395,7 @@ class Scheduler(
                 # complete and the residual cap would force an empty
                 # chunked extend on the next round.
                 req.race_cap = None
+                req.race_t_consume = time.perf_counter()
             return
         if getattr(req, "race_fetch_start", None) is None:
             return
@@ -2464,6 +2466,7 @@ class Scheduler(
             if device_indices is not None:
                 req.race_tail_start = fetched_from
                 req.race_tail_slots = device_indices
+                req.race_t_trim = time.perf_counter()
                 logger.info(
                     f"[RaceTrim] rid={req.rid} tail={tail_n} "
                     f"cap={fetched_from}"
@@ -3043,6 +3046,24 @@ class Scheduler(
             if race_mode and self.chunked_req is None:
                 # Prefill finished: stop and finalize the racing prefetch.
                 self._race_finalize(cr)
+                t_done = time.perf_counter()
+                t0 = getattr(cr, "race_t0", None)
+                if t0 is not None:
+                    t_trim = getattr(cr, "race_t_trim", None)
+                    t_consume = getattr(cr, "race_t_consume", None)
+                    parts = []
+                    if t_trim is not None:
+                        parts.append(f"admit->trim={(t_trim - t0) * 1e3:.0f}ms")
+                        if t_consume is not None:
+                            parts.append(
+                                f"trim->consume={(t_consume - t_trim) * 1e3:.0f}ms"
+                            )
+                            parts.append(
+                                f"consume->done={(t_done - t_consume) * 1e3:.0f}ms"
+                            )
+                    else:
+                        parts.append(f"admit->done={(t_done - t0) * 1e3:.0f}ms")
+                    logger.info(f"[RaceTiming] rid={cr.rid} " + " ".join(parts))
 
         if self.enable_lora:
             running_loras = {
