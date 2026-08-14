@@ -2390,6 +2390,10 @@ class Scheduler(
                 )
                 req.race_tail_slots = None
                 req.race_tail_start = None
+                # Clear the cap set by the trim round: the prefix is now
+                # complete and the residual cap would force an empty
+                # chunked extend on the next round.
+                req.race_cap = None
             return
         if getattr(req, "race_fetch_start", None) is None:
             return

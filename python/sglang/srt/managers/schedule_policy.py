@@ -748,6 +748,11 @@ class PrefillAdder:
         if race_cap is not None:
             cand_extend_input_len = min(cand_extend_input_len, race_cap)
             force_chunked = True
+        # After race tail consumption the prefix is already complete; never
+        # emit an empty extend chunk (forward would crash on 0-sized hidden
+        # states). Let the request flow to decode instead.
+        if cand_extend_input_len <= 0:
+            return None
         truncated = cand_extend_input_len > _rem_tokens or force_chunked
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
