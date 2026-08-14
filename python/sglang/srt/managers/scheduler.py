@@ -990,6 +990,15 @@ class Scheduler(
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
+        if (
+            self.server_args.hicache_storage_prefetch_policy == "suffix_race"
+            and self.chunked_prefill_size is not None
+        ):
+            # suffix_race needs fine-grained chunks so the scheduler can react
+            # to prefetch progress at fine boundaries; a coarse chunk
+            # overshoots the meeting point and the race degenerates to full
+            # recompute.
+            self.chunked_prefill_size = min(self.chunked_prefill_size, 512)
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -2406,6 +2415,7 @@ class Scheduler(
             f"[RaceStep] rid={req.rid} cfe={cfe} total={total} "
             f"cur={cur} fetched_from={fetched_from}"
         )
+        req.race_cap = max(0, fetched_from - cur) if (cfe > 0 and fetched_from > cur and getattr(req, "race_fetch_start", None) is not None) else None
         if cfe > 0 and cur >= fetched_from:
             # Meeting point: everything beyond cur has been fetched.
             n = fetch_end - cur

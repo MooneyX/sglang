@@ -724,6 +724,13 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        # suffix_race: use fine-grained chunks for racing requests so the
+        # scheduler can react to prefetch progress at fine boundaries (a
+        # coarse chunk overshoots the meeting point and the race degenerates
+        # to full recompute). Only racing requests (race_fetch_start set)
+        # get the small chunk; others keep the global chunked_prefill_size.
+        if getattr(req, "race_fetch_start", None) is not None:
+            _rem_tokens = min(_rem_tokens, 512)
         # suffix_race tail trim: a fetched tail is pending consumption in
         # req.race_tail_slots. Cap this chunk at the tail start so the
         # request skips recomputing fetched pages, and keep it in chunked
@@ -736,6 +743,10 @@ class PrefillAdder:
                 cand_extend_input_len,
                 max(0, race_tail_start - len(req.prefix_indices)),
             )
+            force_chunked = True
+        race_cap = getattr(req, "race_cap", None)
+        if race_cap is not None:
+            cand_extend_input_len = min(cand_extend_input_len, race_cap)
             force_chunked = True
         truncated = cand_extend_input_len > _rem_tokens or force_chunked
         new_len = min(cand_extend_input_len, _rem_tokens)
