@@ -251,6 +251,10 @@ class HiRadixCache(RadixCache):
             self.race_recompute_a_us_auto = (
                 0.8 * self.race_recompute_a_us_auto + 0.2 * rate
             )
+        logger.info(
+            f"[RaceCalib] rate={rate:.1f}us/token "
+            f"auto={self.race_recompute_a_us_auto:.1f}"
+        )
 
     def est_recompute_time(self, num_tokens: int) -> float:
         """Estimated GPU recompute time (seconds) for num_tokens of KV."""
