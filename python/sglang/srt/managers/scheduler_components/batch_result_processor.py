@@ -229,11 +229,19 @@ class SchedulerBatchResultProcessor:
 
                     # Calibrate the race recompute cost model from a pure
                     # recompute (L3-miss) prefill so mode-switch decisions
-                    # track the actual GPU prefill speed.
-                    if getattr(req, "storage_hit_length", 1) == 0 and len(
-                        req.full_untruncated_fill_ids
-                    ) > 0:
-                        t0 = req.time_stats.prefill_bootstrap_queue_entry_time
+                    # track the actual GPU prefill speed. Skip racing requests
+                    # (race_t0 set): their prefill mixes L3 consumption and
+                    # would pollute the rate.
+                    if (
+                        getattr(req, "storage_hit_length", 1) == 0
+                        and len(req.full_untruncated_fill_ids) > 0
+                        and getattr(req, "race_t0", None) is None
+                    ):
+                        t0 = req.time_stats.wait_queue_entry_time
+                        if t0 <= 0:
+                            t0 = (
+                                req.time_stats.prefill_bootstrap_queue_entry_time
+                            )
                         t1 = req.time_stats.last_prefill_finished_time
                         if t0 > 0 and t1 > t0:
                             self.tree_cache.calibrate_recompute_rate(
