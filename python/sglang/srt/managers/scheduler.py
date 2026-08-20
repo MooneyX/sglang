@@ -2421,6 +2421,29 @@ class Scheduler(
             f"[RaceStep] rid={req.rid} cfe={cfe} total={total} "
             f"cur={cur} fetched_from={fetched_from}"
         )
+        # Observability only (no behaviour change): quantify the cross-request
+        # opportunity cost of keeping the GPU on this request's recompute.
+        #   rec_rem : GPU time still needed to reach the fetched boundary
+        #   pf_rem  : time for the prefetch to cover the rest by itself
+        #   q_pend  : tokens the head-of-queue request still has to recompute
+        # When rec_rem > pf_rem AND q_pend > 0, the GPU spent here is (at
+        # least partly) duplicated work that the queued request could use.
+        if cfe > 0 and self.waiting_queue:
+            rec_rem = tc.est_recompute_time(max(0, fetched_from - cur))
+            pf_rem = tc.est_prefetch_wait(max(0, total - cfe))
+            head = self.waiting_queue[0]
+            q_pend = max(
+                0,
+                len(head.full_untruncated_fill_ids) - len(head.prefix_indices),
+            )
+            logger.info(
+                f"[RaceOppCost] rid={req.rid} cur={cur} "
+                f"fetched_from={fetched_from} cfe={cfe}/{total} "
+                f"rec_rem={rec_rem * 1e3:.0f}ms pf_rem={pf_rem * 1e3:.0f}ms "
+                f"past_cross={int(rec_rem > pf_rem)} "
+                f"qlen={len(self.waiting_queue)} q_pend={q_pend} "
+                f"q_gain={tc.est_recompute_time(q_pend) * 1e3:.0f}ms"
+            )
         req.race_cap = max(0, fetched_from - cur) if (cfe > 0 and fetched_from > cur and getattr(req, "race_fetch_start", None) is not None) else None
         if cfe > 0 and cur >= fetched_from:
             # Meeting point: everything beyond cur has been fetched.
