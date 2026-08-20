@@ -2400,6 +2400,7 @@ class Scheduler(
                 # chunked extend on the next round.
                 req.race_cap = None
                 req.race_boundary = None
+                req.race_progress_prev = None
                 req.race_t_consume = time.perf_counter()
             return
         if getattr(req, "race_fetch_start", None) is None:
@@ -2450,6 +2451,33 @@ class Scheduler(
                 f"q_gain={tc.est_recompute_time(q_pend) * 1e3:.0f}ms"
             )
         req.race_cap = max(0, fetched_from - cur) if (cfe > 0 and fetched_from > cur and getattr(req, "race_fetch_start", None) is not None) else None
+        # Measure how fast the two frontiers actually close on each other, so
+        # the adder can size a chunk without relying on a calibrated cost
+        # model.
+        #
+        # A static ratio p/(a+p) derived from per-token costs (110us GPU /
+        # 48us prefetch -> 0.30) is wrong under concurrency: a request is
+        # scheduled once per round and queues in between, so its EFFECTIVE GPU
+        # rate is roughly a*N_concurrent. Reverse-engineering the 16-request
+        # run that held 90.9% reuse gives 12802/140288 = 0.09 -- 3.3x below
+        # the static value. That gap is why any fixed ratio either overshoots
+        # the meeting point (large) or slices the prefill needlessly (small).
+        #
+        # Both deltas are consensus-safe: cur is identical on every rank by
+        # construction, and cfe is MIN-reduced above.
+        prev = getattr(req, "race_progress_prev", None)
+        if prev is not None:
+            d_cur = cur - prev[0]
+            d_cfe = cfe - prev[1]
+            if d_cur > 0 or d_cfe > 0:
+                # Integer permille keeps every rank bit-identical.
+                ratio = (d_cur * 1000) // max(1, d_cur + d_cfe)
+                old = getattr(req, "race_progress_ratio", None)
+                # EWMA (alpha 1/4) in integer arithmetic.
+                req.race_progress_ratio = (
+                    ratio if old is None else (3 * old + ratio) // 4
+                )
+        req.race_progress_prev = (cur, cfe)
         # Publish the fetched boundary for PrefillAdder.race_chunk_limit().
         # Derived from the TP MIN-reduced cfe above, so all ranks agree (chunk
         # shapes must match across ranks or the forward pass diverges).
@@ -2535,11 +2563,15 @@ class Scheduler(
         # boundary would keep capping chunks (and could stall a request whose
         # frontier sits exactly on it).
         req.race_boundary = None
+        # Progress tracking is per-race: a stale (cur, cfe) pair from a
+        # finished race would make the next race's first delta meaningless.
+        req.race_progress_prev = None
         logger.info(
             f"[RaceFinalize] rid={req.rid} "
             f"prefetch_len={m.get('prefetch_len', 0)} "
             f"completed={m.get('completed_tokens', 0)} "
             f"consumed={getattr(req, 'race_consumed', 0)} "
+            f"ratio={getattr(req, 'race_progress_ratio', None)} "
             f"prefetch_dur={m.get('prefetch_dur', 0.0):.3f}"
         )
 
