@@ -703,6 +703,49 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def race_chunk_limit(self, req: Req) -> Optional[int]:
+        """Adaptive chunk size for a suffix_race request (None = no limit).
+
+        Why adaptive: _race_step only re-checks the meeting point at chunk
+        boundaries, so the chunk must not step past the fetched boundary
+        (fetched_from) or the fetched tail is wasted and the request fully
+        recomputes. A fixed small clamp (the previous 512) guarantees that,
+        but under concurrency it slices every racing prefill into many
+        scheduling rounds, and each round re-queues behind the other
+        requests. Measured on a 16-request contended workload: queue_dur
+        1.252s (race, 512 chunks) vs 0.0096s (wait_complete, single chunk),
+        while the duplicated GPU recompute was only ~1.4s in total -- the
+        re-queueing, not the duplicated compute, dominated the TTFT gap.
+
+        The distance to the meeting point is exactly what bounds a safe
+        chunk, so use it directly:
+          * prefetch progress unknown yet (cfe == 0): the boundary is at the
+            very end of the fetch range, so any chunk is safe -> no limit.
+          * boundary known and ahead of the frontier: allow up to the
+            boundary (that is the largest chunk that cannot overshoot).
+          * boundary already reached: _race_step consumes it this round;
+            leave the limit off and let race_cap / race_tail_start cap it.
+
+        req.race_boundary is published by Scheduler._race_step after the TP
+        MIN all-reduce of completed_from_end, so every rank derives the same
+        limit (chunk shapes must match across ranks).
+        """
+        if getattr(req, "race_fetch_start", None) is None:
+            return None
+        boundary = getattr(req, "race_boundary", None)
+        if boundary is None:
+            # No prefetch progress observed yet: the fetched region is still
+            # at the tail of the sequence, nothing to overshoot.
+            return None
+        gap = boundary - len(req.prefix_indices)
+        if gap <= 0:
+            return None
+        # Page-align down so the chunk ends on a page boundary; the race
+        # consumption path works in whole pages.
+        if self.page_size > 1:
+            gap = max(self.page_size, gap - (gap % self.page_size))
+        return gap
+
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
@@ -724,13 +767,14 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        # suffix_race: use fine-grained chunks for racing requests so the
-        # scheduler can react to prefetch progress at fine boundaries (a
-        # coarse chunk overshoots the meeting point and the race degenerates
-        # to full recompute). Only racing requests (race_fetch_start set)
-        # get the small chunk; others keep the global chunked_prefill_size.
-        if getattr(req, "race_fetch_start", None) is not None:
-            _rem_tokens = min(_rem_tokens, 512)
+        # suffix_race: adaptive chunk for racing requests. See
+        # race_chunk_limit() -- the chunk is sized by the actual distance to
+        # the meeting point, so a far-away prefetch still gets large chunks
+        # (few scheduling rounds, little re-queueing) while a nearby one is
+        # narrowed so the frontier cannot overshoot the fetched boundary.
+        race_limit = self.race_chunk_limit(req)
+        if race_limit is not None:
+            _rem_tokens = min(_rem_tokens, race_limit)
         # suffix_race tail trim: a fetched tail is pending consumption in
         # req.race_tail_slots. Cap this chunk at the tail start so the
         # request skips recomputing fetched pages, and keep it in chunked
@@ -994,6 +1038,20 @@ class PrefillAdder:
                 # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
+            # suffix_race: a racing request must not commit the whole sequence
+            # in one shot when the fetched boundary lies inside it -- the
+            # frontier would sweep past the meeting point and the prefetched
+            # tail would be recomputed instead of reused.
+            # race_chunk_limit() returns None when the boundary is unknown or
+            # already reached, so non-racing requests are unaffected. Only
+            # meaningful when chunked prefill is enabled: with
+            # rem_chunk_tokens None there is no truncation path to fall back
+            # to (the else branch would divide None by page_size).
+            race_first_limit = (
+                self.race_chunk_limit(req)
+                if self.rem_chunk_tokens is not None
+                else None
+            )
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
@@ -1004,7 +1062,9 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif (
+                self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens
+            ) and (race_first_limit is None or input_tokens <= race_first_limit):
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1033,6 +1093,11 @@ class PrefillAdder:
                     return AddReqResult.OTHER
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                # suffix_race: never truncate past the fetched boundary (see
+                # race_chunk_limit); the tail beyond it is already on host.
+                if race_first_limit is not None:
+                    trunc_len = min(trunc_len, race_first_limit)
+                    trunc_len = trunc_len // self.page_size * self.page_size
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER

@@ -990,15 +990,17 @@ class Scheduler(
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
-        if (
-            self.server_args.hicache_storage_prefetch_policy == "suffix_race"
-            and self.chunked_prefill_size is not None
-        ):
-            # suffix_race needs fine-grained chunks so the scheduler can react
-            # to prefetch progress at fine boundaries; a coarse chunk
-            # overshoots the meeting point and the race degenerates to full
-            # recompute.
-            self.chunked_prefill_size = min(self.chunked_prefill_size, 512)
+        # NOTE: suffix_race used to clamp the GLOBAL chunked_prefill_size to
+        # 512 here so the scheduler could react to prefetch progress at fine
+        # boundaries. That fixed the single-request overshoot but caused a
+        # severe regression under concurrency: every racing request advanced
+        # only 512 tokens per scheduling round, so its prefill was sliced into
+        # many rounds and re-queued each time (measured queue_dur 1.252s vs
+        # 0.0096s for wait_complete on a 16-request contended workload, while
+        # the duplicated GPU recompute was only ~1.4s in total).
+        # The chunk granularity is now decided per racing request in
+        # PrefillAdder.race_chunk_limit(), based on the actual distance to the
+        # meeting point instead of a fixed global clamp.
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -2382,9 +2384,11 @@ class Scheduler(
         # (the race was already finalized at trim time).
         if getattr(req, "race_tail_slots", None) is not None:
             if len(req.prefix_indices) >= req.race_tail_start:
+                n_tail = len(req.race_tail_slots)
+                req.race_consumed = getattr(req, "race_consumed", 0) + n_tail
                 logger.info(
                     f"[RaceTrimConsume] rid={req.rid} "
-                    f"n={len(req.race_tail_slots)}"
+                    f"n={n_tail} total_consumed={req.race_consumed}"
                 )
                 req.prefix_indices = torch.cat(
                     [req.prefix_indices, req.race_tail_slots]
@@ -2395,6 +2399,7 @@ class Scheduler(
                 # complete and the residual cap would force an empty
                 # chunked extend on the next round.
                 req.race_cap = None
+                req.race_boundary = None
                 req.race_t_consume = time.perf_counter()
             return
         if getattr(req, "race_fetch_start", None) is None:
@@ -2445,6 +2450,12 @@ class Scheduler(
                 f"q_gain={tc.est_recompute_time(q_pend) * 1e3:.0f}ms"
             )
         req.race_cap = max(0, fetched_from - cur) if (cfe > 0 and fetched_from > cur and getattr(req, "race_fetch_start", None) is not None) else None
+        # Publish the fetched boundary for PrefillAdder.race_chunk_limit().
+        # Derived from the TP MIN-reduced cfe above, so all ranks agree (chunk
+        # shapes must match across ranks or the forward pass diverges).
+        # None while no progress is known: the fetched region is still at the
+        # tail, so no chunk can overshoot it and the adder imposes no limit.
+        req.race_boundary = fetched_from if cfe > 0 else None
         if cfe > 0 and cur >= fetched_from:
             # Meeting point: everything beyond cur has been fetched.
             n = fetch_end - cur
@@ -2458,7 +2469,15 @@ class Scheduler(
                     req.prefix_indices = torch.cat(
                         [req.prefix_indices, device_indices]
                     )
-                    logger.debug(f"[RaceConsume] rid={req.rid} n={n}")
+                    # info level: this is the ONLY record of race consumption
+                    # on the meeting path, and PrefetchMeasure reports
+                    # l3_loaded=0 for race requests. Keeping it at debug made
+                    # a 90.9% reuse rate look like 0% in the benchmarks.
+                    req.race_consumed = getattr(req, "race_consumed", 0) + n
+                    logger.info(
+                        f"[RaceConsume] rid={req.rid} n={n} "
+                        f"cur={cur} total_consumed={req.race_consumed}"
+                    )
                 else:
                     tc.race_unregister_load_ack(ack_id, last_host_node)
                     logger.info(f"[RaceConsume] rid={req.rid} LOAD_FAILED n={n}")
@@ -2512,10 +2531,15 @@ class Scheduler(
         tc = self.tree_cache
         m = tc.race_finalize_prefetch(req.rid)
         req.race_fetch_start = None
+        # Drop the adaptive-chunk limit: with the race over, a residual
+        # boundary would keep capping chunks (and could stall a request whose
+        # frontier sits exactly on it).
+        req.race_boundary = None
         logger.info(
             f"[RaceFinalize] rid={req.rid} "
             f"prefetch_len={m.get('prefetch_len', 0)} "
             f"completed={m.get('completed_tokens', 0)} "
+            f"consumed={getattr(req, 'race_consumed', 0)} "
             f"prefetch_dur={m.get('prefetch_dur', 0.0):.3f}"
         )
 
@@ -3246,11 +3270,22 @@ class Scheduler(
                 # fetch completing later can never be consumed by them, so
                 # finalize the racing prefetch right away (fetched pages are
                 # inserted into the tree for future reuse).
-                if getattr(req, "race_fetch_start", None) is not None and (
-                    len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
-                    <= chunked_prefill_size
-                ):
-                    self._race_finalize(req)
+                # The effective chunk bound is the adaptive race limit when
+                # one applies (a known fetched boundary inside the sequence
+                # forces truncation there), otherwise the global size.
+                if getattr(req, "race_fetch_start", None) is not None:
+                    race_limit = adder.race_chunk_limit(req)
+                    effective_chunk = (
+                        chunked_prefill_size
+                        if race_limit is None
+                        else min(chunked_prefill_size, race_limit)
+                    )
+                    if (
+                        len(req.full_untruncated_fill_ids)
+                        - len(req.prefix_indices)
+                        <= effective_chunk
+                    ):
+                        self._race_finalize(req)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
