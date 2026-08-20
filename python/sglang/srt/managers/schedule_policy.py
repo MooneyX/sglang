@@ -703,48 +703,73 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    # suffix_race adaptive chunk: fraction of the distance-to-boundary that a
+    # single chunk may consume, as an exact integer ratio (see
+    # race_chunk_limit for the derivation). Integer arithmetic keeps the
+    # result bit-identical across TP ranks.
+    RACE_CHUNK_NUM = 1
+    RACE_CHUNK_DEN = 4
+    # Never go below this: it is the granularity that was measured to preserve
+    # a ~91% reuse rate, and it bounds the worst-case overshoot.
+    RACE_CHUNK_MIN = 512
+
     def race_chunk_limit(self, req: Req) -> Optional[int]:
         """Adaptive chunk size for a suffix_race request (None = no limit).
 
-        Why adaptive: _race_step only re-checks the meeting point at chunk
-        boundaries, so the chunk must not step past the fetched boundary
-        (fetched_from) or the fetched tail is wasted and the request fully
-        recomputes. A fixed small clamp (the previous 512) guarantees that,
-        but under concurrency it slices every racing prefill into many
-        scheduling rounds, and each round re-queues behind the other
-        requests. Measured on a 16-request contended workload: queue_dur
-        1.252s (race, 512 chunks) vs 0.0096s (wait_complete, single chunk),
-        while the duplicated GPU recompute was only ~1.4s in total -- the
-        re-queueing, not the duplicated compute, dominated the TTFT gap.
+        _race_step only re-checks the meeting point at chunk boundaries, so a
+        chunk that runs too far makes the compute frontier overshoot the
+        fetched region and the prefetched tail is recomputed instead of
+        reused. Two failure modes, both measured on the same 16-request
+        contended workload (Qwen3-32B TP8, mooncake L3):
 
-        The distance to the meeting point is exactly what bounds a safe
-        chunk, so use it directly:
-          * prefetch progress unknown yet (cfe == 0): the boundary is at the
-            very end of the fetch range, so any chunk is safe -> no limit.
-          * boundary known and ahead of the frontier: allow up to the
-            boundary (that is the largest chunk that cannot overshoot).
-          * boundary already reached: _race_step consumes it this round;
-            leave the limit off and let race_cap / race_tail_start cap it.
+          fixed 512 chunks     reuse 90.9%  recompute 12802 tok
+                               queue_dur 1.252s  TTFT 3.148s
+          chunk = full gap     reuse 66.2%  recompute 47418 tok
+                               queue_dur 1.004s  TTFT 3.618s
 
-        req.race_boundary is published by Scheduler._race_step after the TP
-        MIN all-reduce of completed_from_end, so every rank derives the same
-        limit (chunk shapes must match across ranks).
+        Larger chunks do cut re-queueing (queue_dur -20%) but running all the
+        way to the boundary loses far more to duplicated compute. The reason
+        is that the boundary is not static: while a chunk executes, the
+        prefetch keeps completing and fetched_from moves BACKWARD, so the
+        real meeting point ends up behind where the chunk stops. Observed
+        directly -- `cur=16384 fetched_from=0 cfe=16447/16447`, i.e. the
+        frontier had recomputed the whole 16K prefix before noticing that the
+        prefetch had already delivered everything.
+
+        So bound the chunk by the *predicted* meeting point rather than the
+        current boundary. With GPU cost a per token and prefetch cost p per
+        token, the frontier at cur and the boundary at B meet at
+            x = (cur*a + B*p) / (a + p)
+        i.e. the chunk may cover (B - cur) * p / (a + p). Measured rates
+        (a ~= 110us/token calibrated, p ~= 48us/token floor) give a fraction
+        of ~0.30, so use 1/4 -- slightly conservative, and expressed as an
+        exact integer ratio so every TP rank derives the identical chunk
+        (mismatched chunk shapes across ranks diverge the forward pass).
+
+        req.race_boundary is published by Scheduler._race_step from the TP
+        MIN-reduced completed_from_end, so the input is consistent too.
         """
         if getattr(req, "race_fetch_start", None) is None:
             return None
         boundary = getattr(req, "race_boundary", None)
         if boundary is None:
-            # No prefetch progress observed yet: the fetched region is still
-            # at the tail of the sequence, nothing to overshoot.
-            return None
+            # No prefetch progress observed yet. Returning None here would let
+            # the request commit its whole prefix in one chunk and finish
+            # prefill before the prefetch reports anything -- observed as
+            # `cur=16384 fetched_from=0 cfe=16447/16447`, a full 16K recompute
+            # of a prefix that was already fully fetched. Fall back to the
+            # floor so the frontier stops early enough to observe progress.
+            return self.RACE_CHUNK_MIN
         gap = boundary - len(req.prefix_indices)
         if gap <= 0:
             return None
-        # Page-align down so the chunk ends on a page boundary; the race
-        # consumption path works in whole pages.
+        limit = gap * self.RACE_CHUNK_NUM // self.RACE_CHUNK_DEN
+        limit = max(limit, self.RACE_CHUNK_MIN)
+        limit = min(limit, gap)
+        # Page-align down; the race consumption path works in whole pages.
         if self.page_size > 1:
-            gap = max(self.page_size, gap - (gap % self.page_size))
-        return gap
+            limit = max(self.page_size, limit - (limit % self.page_size))
+        return limit
 
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
