@@ -708,10 +708,18 @@ class PrefillAdder:
     # race_chunk_limit for the derivation). Integer arithmetic keeps the
     # result bit-identical across TP ranks.
     RACE_CHUNK_NUM = 1
-    RACE_CHUNK_DEN = 4
+    RACE_CHUNK_DEN = 8
     # Never go below this: it is the granularity that was measured to preserve
     # a ~91% reuse rate, and it bounds the worst-case overshoot.
     RACE_CHUNK_MIN = 512
+    # Never go above this: a racing request that advances too far per round
+    # drains the prefetch capacity pool (cache_controller.prefetch_capacity_
+    # limit = 0.5 * host pool) before the fetches it depends on complete, and
+    # later requests get prefetch_len=0 (prefetch refused outright).
+    # Measured on the 16-request contended workload: with an aggressive 1/4
+    # ratio, 14 of 16 requests ended up with cached_tokens=0 and the reuse
+    # rate collapsed to 19.3%, while the 512-chunk baseline kept 90.9%.
+    RACE_CHUNK_MAX = 2048
 
     def race_chunk_limit(self, req: Req) -> Optional[int]:
         """Adaptive chunk size for a suffix_race request (None = no limit).
@@ -719,32 +727,41 @@ class PrefillAdder:
         _race_step only re-checks the meeting point at chunk boundaries, so a
         chunk that runs too far makes the compute frontier overshoot the
         fetched region and the prefetched tail is recomputed instead of
-        reused. Two failure modes, both measured on the same 16-request
-        contended workload (Qwen3-32B TP8, mooncake L3):
+        reused. Measured on one 16-request contended workload (Qwen3-32B TP8,
+        mooncake L3, 6x16K + 10x4K):
 
-          fixed 512 chunks     reuse 90.9%  recompute 12802 tok
-                               queue_dur 1.252s  TTFT 3.148s
-          chunk = full gap     reuse 66.2%  recompute 47418 tok
-                               queue_dur 1.004s  TTFT 3.618s
+          chunk policy     reuse   recompute   queue_dur  qps    TTFT
+          fixed 512        90.9%   12802 tok   1.252 s    4.21   3.148 s
+          full gap         66.2%   47418 tok   1.004 s    3.74   3.618 s
+          gap/4 (cap none) 19.3%  113187 tok   0.345 s    4.80   2.691 s
 
-        Larger chunks do cut re-queueing (queue_dur -20%) but running all the
-        way to the boundary loses far more to duplicated compute. The reason
-        is that the boundary is not static: while a chunk executes, the
-        prefetch keeps completing and fetched_from moves BACKWARD, so the
-        real meeting point ends up behind where the chunk stops. Observed
-        directly -- `cur=16384 fetched_from=0 cfe=16447/16447`, i.e. the
-        frontier had recomputed the whole 16K prefix before noticing that the
-        prefetch had already delivered everything.
+        Two independent limits show up in that table:
 
-        So bound the chunk by the *predicted* meeting point rather than the
-        current boundary. With GPU cost a per token and prefetch cost p per
-        token, the frontier at cur and the boundary at B meet at
-            x = (cur*a + B*p) / (a + p)
-        i.e. the chunk may cover (B - cur) * p / (a + p). Measured rates
-        (a ~= 110us/token calibrated, p ~= 48us/token floor) give a fraction
-        of ~0.30, so use 1/4 -- slightly conservative, and expressed as an
-        exact integer ratio so every TP rank derives the identical chunk
-        (mismatched chunk shapes across ranks diverge the forward pass).
+        1. The meeting point moves. While a chunk executes the prefetch keeps
+           completing and fetched_from travels BACKWARD, so the real meeting
+           point ends up behind where the chunk stops. Observed directly as
+           `cur=16384 fetched_from=0 cfe=16447/16447` -- a whole 16K prefix
+           recomputed after it had already been fully fetched. Bound the chunk
+           by the PREDICTED meeting point instead: with GPU cost a and
+           prefetch cost p per token, a frontier at cur and a boundary at B
+           meet at (cur*a + B*p)/(a+p), so a chunk may cover
+           (B-cur) * p/(a+p). Calibrated rates (a ~= 110us/token,
+           p ~= 48us/token) give ~0.30.
+
+        2. The prefetch capacity pool is shared. cache_controller refuses new
+           prefetches once prefetch_tokens_occupied reaches
+           prefetch_capacity_limit (0.5 * host pool). A racing request that
+           advances aggressively drains that pool before the fetches complete,
+           and later requests get prefetch_len=0 -- no prefetch at all. That
+           is what killed the gap/4 run: 14 of 16 requests had
+           cached_tokens=0. This limit has nothing to do with the meeting
+           point, so it needs its own ceiling (RACE_CHUNK_MAX).
+
+        Hence: ratio 1/8 (conservative w.r.t. limit 1), floored at 512
+        (the granularity measured to hold ~91% reuse) and capped at 2048
+        (keeps the capacity pool from being drained). Exact integer ratio so
+        every TP rank derives the identical chunk -- mismatched chunk shapes
+        across ranks diverge the forward pass.
 
         req.race_boundary is published by Scheduler._race_step from the TP
         MIN-reduced completed_from_end, so the input is consistent too.
@@ -765,7 +782,7 @@ class PrefillAdder:
             return None
         limit = gap * self.RACE_CHUNK_NUM // self.RACE_CHUNK_DEN
         limit = max(limit, self.RACE_CHUNK_MIN)
-        limit = min(limit, gap)
+        limit = min(limit, self.RACE_CHUNK_MAX, gap)
         # Page-align down; the race consumption path works in whole pages.
         if self.page_size > 1:
             limit = max(self.page_size, limit - (limit % self.page_size))
