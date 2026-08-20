@@ -192,6 +192,14 @@ class HiRadixCache(RadixCache):
         # L3-miss prefills so mode-switch decisions track the actual GPU
         # prefill speed instead of the DS-V3 default constants.
         self.race_recompute_a_us_auto: Optional[float] = None
+        # EWMA (integer permille) of how the compute frontier and the fetched
+        # boundary converge during a race: d_cur / (d_cur + d_cfe). Shared
+        # across requests on purpose -- the value is dominated by how many
+        # requests share the batch, which is a property of the server, not of
+        # one request. Most races only get 1-3 chunk boundaries, far too few
+        # samples to learn per-request. Written by Scheduler._race_step, read
+        # by PrefillAdder.race_chunk_limit.
+        self.race_progress_ratio: Optional[int] = None
         # EWMA of full prefetch op wall time (queue+exec) and per-token fetch
         # time, used to estimate prefetch queue wait for race decisions.
         self.pf_op_time_ewma: Optional[float] = None

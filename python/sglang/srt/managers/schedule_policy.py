@@ -704,7 +704,7 @@ class PrefillAdder:
         )
 
     # suffix_race adaptive chunk bounds. The ratio itself is NOT a constant --
-    # it is measured at runtime (req.race_progress_ratio, in permille) because
+    # it is measured at runtime (tree_cache.race_progress_ratio, permille) because
     # the effective GPU rate depends on how many requests share the batch.
     # This fallback is only used before the first measurement lands: the
     # per-token calibration (110us GPU / 48us prefetch) predicts 0.30, but the
@@ -753,9 +753,12 @@ class PrefillAdder:
         implies r = 12802/140288 = 0.09 -- 3.3x below the static prediction.
         Any hard-coded ratio therefore mis-sizes chunks by a factor that tracks
         the concurrency level, which is exactly what the table above shows.
-        Scheduler._race_step measures r per round (integer permille, EWMA) from
-        deltas that are already rank-consistent: cur is identical on every rank
-        by construction, cfe is MIN-reduced.
+        Scheduler._race_step measures r (integer permille, EWMA) from deltas
+        that are already rank-consistent: cur is identical on every rank by
+        construction, cfe is MIN-reduced. It lives on the tree cache rather
+        than the request because a race usually only reaches 1-3 chunk
+        boundaries -- too few samples per request -- and because the value is
+        really a property of batch-wide concurrency.
 
         Note the rule is self-tapering: gap shrinks as the frontier advances,
         so the same ratio yields large chunks while the boundary is far away
@@ -776,7 +779,7 @@ class PrefillAdder:
         gap = boundary - len(req.prefix_indices)
         if gap <= 0:
             return None
-        ratio = getattr(req, "race_progress_ratio", None)
+        ratio = getattr(self.tree_cache, "race_progress_ratio", None)
         if ratio is None:
             ratio = self.RACE_RATIO_INIT_PERMILLE
         # Integer permille arithmetic: identical on every TP rank.

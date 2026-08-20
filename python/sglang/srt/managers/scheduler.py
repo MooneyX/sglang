@@ -2465,19 +2465,33 @@ class Scheduler(
         #
         # Both deltas are consensus-safe: cur is identical on every rank by
         # construction, and cfe is MIN-reduced above.
+        #
+        # _race_step runs several times per scheduling round (once per rank,
+        # and again while the request sits in the waiting queue), so most calls
+        # see d_cur == 0. Sampling those would divide by a d_cfe-only interval
+        # and yield a ratio near 0, or -- when a lone chunk lands between two
+        # otherwise idle samples -- near 1000. Observed exactly that: 48
+        # requests never learned a ratio and the rest latched onto 600/1000
+        # instead of the expected ~90. So only sample when the frontier has
+        # actually moved, and measure the boundary travel over the SAME
+        # interval by anchoring both to the last frontier advance.
         prev = getattr(req, "race_progress_prev", None)
-        if prev is not None:
+        if prev is None:
+            req.race_progress_prev = (cur, cfe)
+        elif cur > prev[0]:
             d_cur = cur - prev[0]
-            d_cfe = cfe - prev[1]
-            if d_cur > 0 or d_cfe > 0:
-                # Integer permille keeps every rank bit-identical.
-                ratio = (d_cur * 1000) // max(1, d_cur + d_cfe)
-                old = getattr(req, "race_progress_ratio", None)
-                # EWMA (alpha 1/4) in integer arithmetic.
-                req.race_progress_ratio = (
-                    ratio if old is None else (3 * old + ratio) // 4
-                )
-        req.race_progress_prev = (cur, cfe)
+            d_cfe = max(0, cfe - prev[1])
+            # Integer permille keeps every rank bit-identical.
+            ratio = (d_cur * 1000) // (d_cur + d_cfe)
+            old = tc.race_progress_ratio
+            # EWMA (alpha 1/4) in integer arithmetic. Kept on the cache, not
+            # the request: a race typically only gets 1-3 chunk boundaries,
+            # which is far too few samples, and the value tracks batch-wide
+            # concurrency anyway.
+            tc.race_progress_ratio = (
+                ratio if old is None else (3 * old + ratio) // 4
+            )
+            req.race_progress_prev = (cur, cfe)
         # Publish the fetched boundary for PrefillAdder.race_chunk_limit().
         # Derived from the TP MIN-reduced cfe above, so all ranks agree (chunk
         # shapes must match across ranks or the forward pass diverges).
@@ -2571,7 +2585,7 @@ class Scheduler(
             f"prefetch_len={m.get('prefetch_len', 0)} "
             f"completed={m.get('completed_tokens', 0)} "
             f"consumed={getattr(req, 'race_consumed', 0)} "
-            f"ratio={getattr(req, 'race_progress_ratio', None)} "
+            f"ratio={tc.race_progress_ratio} "
             f"prefetch_dur={m.get('prefetch_dur', 0.0):.3f}"
         )
 
