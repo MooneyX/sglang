@@ -3364,6 +3364,14 @@ class Scheduler(
                         req.mamba_pool_idx.unsqueeze(-1)
                     )
                     req.mamba_pool_idx = None
+                if res == AddReqResult.SKIP_REQ:
+                    # Only this request is unservable (it would need a second
+                    # chunked-prefill slot); the batch still has room, so keep
+                    # scanning instead of head-of-line blocking everything
+                    # behind it. The request was not appended to can_run_list,
+                    # so new_chunked_req is untouched and the
+                    # `assert self.chunked_req is None` below still holds.
+                    continue
                 break
 
         if mamba_allocator is not None:

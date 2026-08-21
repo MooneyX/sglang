@@ -268,6 +268,13 @@ class SchedulerDllmMixin:
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     self.running_batch.batch_is_full = True
+                if res == AddReqResult.SKIP_REQ:
+                    # Unreachable today: add_one_req only returns SKIP_REQ from
+                    # the non-dllm truncation branch, and this adder always
+                    # carries a dllm_config. Handled anyway so a future
+                    # refactor cannot silently turn a per-request skip into a
+                    # batch-wide stop.
+                    continue
                 break
 
         return res

@@ -420,6 +420,12 @@ class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
+    # This request cannot be added, but later ones still can: the blocker is a
+    # property of this request alone, not of the batch budget. The caller skips
+    # it and keeps scanning the waiting queue instead of stopping. Distinct
+    # from OTHER, which signals a batch-wide condition (delayer veto, request
+    # cap, exhausted input budget) where scanning further is pointless.
+    SKIP_REQ = auto()
 
 
 class PrefillAdder:
@@ -1135,8 +1141,15 @@ class PrefillAdder:
                 # unreachable, but the suffix_race tail trim caps a chunked
                 # request's chunk below budget, which can leave budget for a
                 # second truncation -- refuse it and retry next round.
+                #
+                # SKIP_REQ rather than OTHER: the refusal is about THIS request
+                # needing a second chunk slot, not about the batch being out of
+                # room. Returning OTHER made the caller stop scanning, so one
+                # long request at the queue head blocked every short request
+                # behind it even with 93% of the chunk budget still free
+                # (measured: #new-seq:1 #new-token:512 #queue-req:5).
                 if has_chunked_req:
-                    return AddReqResult.OTHER
+                    return AddReqResult.SKIP_REQ
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
                 # suffix_race: never truncate past the fetched boundary (see
