@@ -2308,23 +2308,31 @@ class Scheduler(
                     # Per-request mode selection. Default is the pure race
                     # (admit immediately, resolve the meeting point at chunk
                     # boundaries). Switch to wait-mode (behave like
-                    # wait_complete for this request) only when the GPU is
-                    # idle AND fetching the whole prefix is clearly cheaper
-                    # than recomputing it (i* < 0 regime): there the race's
-                    # boundary-sync / copy / GIL-contention overhead exceeds
-                    # any overlap gain. Empirically the wait/race boundary
-                    # sits at wait_est ~= 0.8 * recompute_est across all
-                    # backends and lengths we measured (file fast/slow,
-                    # mooncake TCP/RDMA; 8K-64K). Any doubt -> race (robust
-                    # default). MIN vote: all TP ranks must agree on the
-                    # switch.
+                    # wait_complete for this request) when fetching the whole
+                    # prefix is clearly cheaper than recomputing it (i* < 0
+                    # regime): there the race's boundary-sync / copy /
+                    # GIL-contention overhead exceeds any overlap gain.
+                    # Empirically the wait/race boundary sits at
+                    # wait_est ~= 0.8 * recompute_est across all backends and
+                    # lengths we measured (file fast/slow, mooncake TCP/RDMA;
+                    # 8K-64K). Any doubt -> race (robust default). MIN vote:
+                    # all TP ranks must agree on the switch.
+                    #
+                    # No waiting-queue gate here: under contention a waiting
+                    # request does NOT idle the GPU (queued requests fill it),
+                    # so wait-mode's opportunity cost is ~0 exactly when the
+                    # queue is non-empty -- and the contended benchmark shows
+                    # race strictly losing to wait_complete there (3.148s vs
+                    # 2.279s, 16-request workload). The old
+                    # `len(waiting_queue) == 0` requirement forced the busiest
+                    # regime into its worst mode. Historical wins are preserved
+                    # either way: slow-backend sequential (file: race 0.950s vs
+                    # wc 1.990s) still votes race, fast-link sequential (mc)
+                    # still votes wait.
                     tc = self.tree_cache
                     x = len(new_input_tokens)
                     race_wait_est = tc.est_prefetch_wait(x)
-                    vote = int(
-                        len(self.waiting_queue) == 0
-                        and race_wait_est < tc.est_recompute_time(x) * 0.8
-                    )
+                    vote = int(race_wait_est < tc.est_recompute_time(x) * 0.8)
                     t = torch.tensor([vote], dtype=torch.int)
                     tc._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN)
                     if t.item() == 1:
@@ -2894,8 +2902,54 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _maybe_log_gpu_saturation(self):
+        """Observability only (no behaviour change): periodic GPU saturation
+        snapshot for the suffix_race decision chain (yield criterion, chunk
+        sizing, mode switch). Throttled to every 64 scheduling rounds.
+
+        Signals:
+          tok_occ   KV token-pool occupancy (1 = pool full)
+          running   running batch size
+          qlen/q_tok waiting-queue depth and its total pending (recompute) tokens
+          fwd_rate  scheduler rounds per second since the last snapshot
+          pf_q      prefetch tasks queueing (controller queue + io buffer)
+        """
+        self._sat_log_ct = getattr(self, "_sat_log_ct", 0) + 1
+        if self._sat_log_ct % 64 != 0:
+            return
+        now = time.perf_counter()
+        prev_t = getattr(self, "_sat_log_t", None)
+        prev_fwd = getattr(self, "_sat_log_fwd", None)
+        fwd_rate = (
+            (self.forward_ct - prev_fwd) / (now - prev_t)
+            if prev_t is not None and now > prev_t
+            else 0.0
+        )
+        self._sat_log_t, self._sat_log_fwd = now, self.forward_ct
+        tok_occ = 1.0 - (
+            self.token_to_kv_pool_allocator.available_size()
+            / self.max_total_num_tokens
+        )
+        q_tok = sum(
+            len(r.full_untruncated_fill_ids) - len(r.prefix_indices)
+            for r in self.waiting_queue
+        )
+        pf_q = 0
+        if self.enable_hicache_storage:
+            cc = self.tree_cache.cache_controller
+            pf_q = cc.prefetch_queue.qsize()
+            buf = getattr(cc, "prefetch_buffer", None)
+            if buf is not None:
+                pf_q += buf.qsize()
+        logger.info(
+            f"[GPUSat] tok_occ={tok_occ:.2f} running={len(self.running_batch.reqs)} "
+            f"qlen={len(self.waiting_queue)} q_tok={q_tok} "
+            f"fwd_rate={fwd_rate:.1f}/s pf_q={pf_q}"
+        )
+
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self._maybe_log_gpu_saturation()
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:

@@ -293,9 +293,21 @@ class HiRadixCache(RadixCache):
         if buf is not None:
             q += buf.qsize()
         op_time = self.pf_op_time_ewma if self.pf_op_time_ewma else 0.5
+        # Under prefetch queueing, fetches are contention-inflated while the
+        # floor tracks the best-case rate (it drops fast on any quick sample
+        # but rises only 1.1x/op from forward samples, and never from reverse
+        # ones -- that asymmetry intentionally prevents the race -> inflated
+        # floor -> more-race lock-in). After a bandwidth step-DOWN the floor
+        # therefore underestimates the real wait for tens of ops: the mode
+        # vote picks wait when waiting is actually slow, and the race_expire
+        # valve (2x this estimate) fires early. Use the contention-inclusive
+        # EWMA as a lower bound whenever fetches are actually queueing; with
+        # an empty pipeline the floor's idle-rate semantics stay correct.
         token_time = (
             self.pf_token_time_floor if self.pf_token_time_floor else 48e-6
         )
+        if q > 0 and self.pf_token_time_ewma:
+            token_time = max(token_time, self.pf_token_time_ewma)
         return q * op_time + num_tokens * token_time
 
     def prefetch_incomplete(self, req_id: str) -> bool:
