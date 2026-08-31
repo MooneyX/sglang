@@ -2333,6 +2333,16 @@ class Scheduler(
                     x = len(new_input_tokens)
                     race_wait_est = tc.est_prefetch_wait(x)
                     vote = int(race_wait_est < tc.est_recompute_time(x) * 0.8)
+                    logger.info(
+                        f"[RaceVote] x={x} wait_est={race_wait_est:.3f} "
+                        f"rec_est={tc.est_recompute_time(x):.3f} "
+                        f"auto={tc.race_recompute_a_us_auto} "
+                        f"floor={tc.pf_token_time_floor} "
+                        f"ewma={tc.pf_token_time_ewma} "
+                        f"pfq={tc.cache_controller.prefetch_queue.qsize()}"
+                        f"+{getattr(tc.cache_controller, 'prefetch_buffer').qsize() if getattr(tc.cache_controller, 'prefetch_buffer', None) is not None else -1} "
+                        f"vote={vote}"
+                    )
                     t = torch.tensor([vote], dtype=torch.int)
                     tc._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN)
                     if t.item() == 1:
