@@ -797,6 +797,34 @@ class PrefillAdder:
             limit = max(self.page_size, limit - (limit % self.page_size))
         return limit
 
+    def _publish_race_claim(self, req: Req):
+        """suffix_race dual watermark, GPU side: publish the claimed frontier
+        (all tokens computed plus the just-committed in-flight chunk) to the
+        racing prefetch op, in op-local page units. The reverse IO loop skips
+        everything below it, so the two sides never cover the same page.
+
+        Published at chunk commit time (extend_range.end), NOT at chunk
+        completion -- by completion the prefetch would already have lapped
+        the chunk's region. Rank-consistent by construction: the chunk shape
+        derives from the MIN-reduced race boundary, so every rank publishes
+        the identical value. Monotonic per request (extend_range.end only
+        grows), so a stale read by the IO thread costs at most one batch.
+        """
+        if getattr(req, "race_fetch_start", None) is None:
+            return
+        info = self.tree_cache.ongoing_prefetch.get(req.rid)
+        if info is None:
+            return
+        op = info[3]
+        if not getattr(op, "reverse", False):
+            return
+        end = (
+            req.extend_range.end
+            if req.extend_range is not None
+            else len(req.prefix_indices)
+        )
+        local = (end - req.race_fetch_start) // self.page_size
+        op.claimed_upto_pages = min(len(op.hash_value), max(0, local))
 
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
@@ -852,6 +880,7 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens or force_chunked
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        self._publish_race_claim(req)
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -1183,6 +1212,7 @@ class PrefillAdder:
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.prefix_indices) + trunc_len
                 )
+                self._publish_race_claim(req)
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req

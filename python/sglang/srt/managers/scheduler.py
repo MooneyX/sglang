@@ -2947,6 +2947,41 @@ class Scheduler(
             f"fwd_rate={fwd_rate:.1f}/s pf_q={pf_q}"
         )
 
+    def _race_should_park(self, req: Req) -> bool:
+        """Overlap-mode foresight for suffix_race: park the continuation
+        chunk for one round when the prefetch has already covered through
+        the in-flight chunk's end.
+
+        _race_step evaluates the meeting with the COMMITTED cur
+        (len(prefix_indices)), which lags one chunk while that chunk is still
+        on the GPU (extend_range.end is the scheduled-but-uncommitted
+        frontier). Without this check, a continuation chunk starting at the
+        stale cur would be scheduled into the next batch even though the
+        prefetch already delivered those pages -- one full chunk of duplicate
+        compute per meeting. Parking lets the in-flight chunk commit; the
+        next round's _race_step then sees cur >= fetched_from and consumes
+        via the meeting path. In non-overlap mode cur commits before the
+        next scheduling round, so boundary <= cur already fired the meeting
+        inside _race_step and this returns False (no-op).
+
+        Safety: parking keeps self.chunked_req set, so the admission loop
+        sees has_chunked_req=True and cannot create a second chunked request
+        (SKIP_REQ, commit 4a6039c1d) -- the singleton invariant holds. The
+        park lasts at most one round: once the in-flight chunk commits, cur
+        >= boundary and the meeting path consumes.
+        """
+        boundary = getattr(req, "race_boundary", None)
+        if boundary is None:
+            return False
+        er = getattr(req, "extend_range", None)
+        if er is None:
+            return False
+        # Nothing to save when the in-flight chunk already finishes the
+        # prefill -- it completes normally without any consumption.
+        if er.end >= len(req.full_untruncated_fill_ids):
+            return False
+        return boundary <= er.end
+
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._maybe_log_gpu_saturation()
@@ -3191,34 +3226,42 @@ class Scheduler(
                 and self.server_args.hicache_storage_prefetch_policy
                 == "suffix_race"
             )
+            parked = False
             if race_mode:
                 # Consume newly prefetched pages before scheduling the next
                 # chunk so the request skips recomputing them.
                 self._race_step(self.chunked_req)
-            cr = self.chunked_req
-            cr.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(cr)
-            if race_mode and self.chunked_req is None:
-                # Prefill finished: stop and finalize the racing prefetch.
-                self._race_finalize(cr)
-                t_done = time.perf_counter()
-                t0 = getattr(cr, "race_t0", None)
-                if t0 is not None:
-                    t_trim = getattr(cr, "race_t_trim", None)
-                    t_consume = getattr(cr, "race_t_consume", None)
-                    parts = []
-                    if t_trim is not None:
-                        parts.append(f"admit->trim={(t_trim - t0) * 1e3:.0f}ms")
-                        if t_consume is not None:
-                            parts.append(
-                                f"trim->consume={(t_consume - t_trim) * 1e3:.0f}ms"
-                            )
-                            parts.append(
-                                f"consume->done={(t_done - t_consume) * 1e3:.0f}ms"
-                            )
-                    else:
-                        parts.append(f"admit->done={(t_done - t0) * 1e3:.0f}ms")
-                    logger.info(f"[RaceTiming] rid={cr.rid} " + " ".join(parts))
+                # Overlap-mode foresight: if the prefetch already covered
+                # through the in-flight chunk's end, scheduling a
+                # continuation chunk now (with the stale committed cur) would
+                # recompute pages already on host. Park one round; the
+                # meeting path consumes once cur commits.
+                parked = self._race_should_park(self.chunked_req)
+            if not parked:
+                cr = self.chunked_req
+                cr.init_next_round_input()
+                self.chunked_req = adder.add_chunked_req(cr)
+                if race_mode and self.chunked_req is None:
+                    # Prefill finished: stop and finalize the racing prefetch.
+                    self._race_finalize(cr)
+                    t_done = time.perf_counter()
+                    t0 = getattr(cr, "race_t0", None)
+                    if t0 is not None:
+                        t_trim = getattr(cr, "race_t_trim", None)
+                        t_consume = getattr(cr, "race_t_consume", None)
+                        parts = []
+                        if t_trim is not None:
+                            parts.append(f"admit->trim={(t_trim - t0) * 1e3:.0f}ms")
+                            if t_consume is not None:
+                                parts.append(
+                                    f"trim->consume={(t_consume - t_trim) * 1e3:.0f}ms"
+                                )
+                                parts.append(
+                                    f"consume->done={(t_done - t_consume) * 1e3:.0f}ms"
+                                )
+                        else:
+                            parts.append(f"admit->done={(t_done - t0) * 1e3:.0f}ms")
+                        logger.info(f"[RaceTiming] rid={cr.rid} " + " ".join(parts))
 
         if self.enable_lora:
             running_loras = {

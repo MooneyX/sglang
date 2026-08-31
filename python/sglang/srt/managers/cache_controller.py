@@ -192,6 +192,13 @@ class PrefetchOperation(StorageOperation):
         # completed_from_end instead of completed_tokens.
         self.reverse = reverse
         self.completed_from_end = 0
+        # suffix_race dual watermark, prefetch side: op-local page index below
+        # which the GPU has claimed the tokens (already computed or inside the
+        # committed in-flight chunk). Published by the scheduler at chunk
+        # commit time; read by the IO loop before every batch. Plain int --
+        # cross-thread reads under the GIL are atomic, and a stale read only
+        # fetches one extra batch (idempotent dedup absorbs it).
+        self.claimed_upto_pages = 0
         # skip_hit_query=True (suffix_race wait-mode, forward): also use the
         # optimistic path (no storage hit query) but keep head-first
         # completed_tokens semantics.
@@ -1002,13 +1009,16 @@ class HiCacheController:
         n_pages = len(operation.hash_value)
         if operation.reverse:
             # suffix_race: fetch from the tail backward so the most
-            # expensive (latest-position) pages are secured first.
-            ranges = []
-            end = n_pages
-            while end > 0:
-                start = max(0, end - STORAGE_BATCH_SIZE)
-                ranges.append((start, end))
-                end = start
+            # expensive (latest-position) pages are secured first. Ranges
+            # are computed lazily per batch and re-read claimed_upto_pages
+            # each iteration: the GPU publishes its claimed frontier
+            # (including the committed in-flight chunk) at chunk commit time,
+            # and the prefetch must never lap into it -- those pages would be
+            # fetched and then discarded (measured: 8751 tokens ~= 2.2GB of
+            # RDMA traffic per request before this check existed). When the
+            # claim covers everything left, the meeting point has been
+            # reached from the prefetch side and the loop exits early.
+            ranges = self._reverse_ranges(operation, n_pages)
         else:
             ranges = [
                 (i, min(i + STORAGE_BATCH_SIZE, n_pages))
@@ -1046,6 +1056,25 @@ class HiCacheController:
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
+
+    def _reverse_ranges(self, operation, n_pages: int):
+        """Lazy (start, end) batches for a reverse (tail-first) prefetch.
+
+        Re-reads operation.claimed_upto_pages before every batch: pages below
+        the claim are skipped (the GPU computed them or is computing them in
+        the committed in-flight chunk), and when the claim reaches the
+        remaining frontier the generator ends early -- the meeting point was
+        reached from the prefetch side. The skipped head pages are released
+        by the caller's end-of-op append_host_mem_release.
+        """
+        end = n_pages
+        while end > 0:
+            claimed = min(n_pages, max(0, operation.claimed_upto_pages))
+            if end <= claimed:
+                return
+            start = max(claimed, end - STORAGE_BATCH_SIZE)
+            yield start, end
+            end = start
 
     def prefetch_io_aux_func(self):
         """
