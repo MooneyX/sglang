@@ -71,6 +71,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Minimum number of tokens a prefetch op must have completed before its
+# measured per-token time may update pf_token_time_floor. Early-terminated
+# race ops (killed when the compute frontier laps them) contribute only a
+# few IO batches over a short wall time, so their duration/completed ratio
+# is a queue-wait artifact rather than a rate. Well above one IO batch
+# (STORAGE_BATCH_SIZE * page_size, at most a few hundred tokens) so a
+# single-batch sample can never set the floor.
+PF_FLOOR_MIN_SAMPLE_TOKENS = 1024
+
 
 class HiRadixCache(RadixCache):
 
@@ -387,6 +396,17 @@ class HiRadixCache(RadixCache):
             # reverse race-mode fetches always overlap compute and are
             # 2-3x slower; letting the latter set the floor locks the wait
             # decision out forever.
+            #
+            # Sample-size gate (both branches): a race prefetch that gets
+            # terminated early contributes completed_tokens = (a few IO
+            # batches) over a short wall time, so tt = duration/completed
+            # is dominated by the queue wait of a handful of pages and can
+            # be 5x below the real per-token rate. Feeding that into the
+            # floor makes est_prefetch_wait systematically under-estimate,
+            # which biases the race/wait vote toward race. Require a
+            # meaningful sample before a measurement may move the floor.
+            if completed_tokens < PF_FLOOR_MIN_SAMPLE_TOKENS:
+                return
             if not reverse:
                 if self.pf_token_time_floor is None:
                     self.pf_token_time_floor = tt
