@@ -199,6 +199,19 @@ class PrefetchOperation(StorageOperation):
         # cross-thread reads under the GIL are atomic, and a stale read only
         # fetches one extra batch (idempotent dedup absorbs it).
         self.claimed_upto_pages = 0
+        # suffix_race contention-track soft stop line: op-local page index
+        # below which the prefetch must NOT fetch while the scheduler's
+        # waiting queue is non-empty. The scheduler negotiates the economic
+        # meeting point M from measured frontier rates and publishes it here;
+        # pages at/above the line are still fetched, everything below is left
+        # for the GPU to compute, so the single IO thread is released earlier
+        # for the head-of-queue request's own prefetch. 0 = inactive (idle
+        # track: free meeting bounded only by claimed_upto_pages). Same
+        # plain-int GIL semantics as claimed_upto_pages; the effective lower
+        # bound is max(claimed_upto_pages, stop_line_pages), and since the
+        # scheduler clamps M >= the committed in-flight frontier, the stop
+        # line never undercuts the hard claim line.
+        self.stop_line_pages = 0
         # skip_hit_query=True (suffix_race wait-mode, forward): also use the
         # optimistic path (no storage hit query) but keep head-first
         # completed_tokens semantics.
@@ -1066,13 +1079,22 @@ class HiCacheController:
         remaining frontier the generator ends early -- the meeting point was
         reached from the prefetch side. The skipped head pages are released
         by the caller's end-of-op append_host_mem_release.
+
+        operation.stop_line_pages is a second, softer lower bound (the
+        negotiated economic stop M, active only under queueing): pages below
+        it are left for the GPU even though the claim would allow fetching
+        them. The effective floor is the max of the two, so the soft line can
+        only make the prefetch stop EARLIER, never lap into the GPU's claim.
         """
         end = n_pages
         while end > 0:
-            claimed = min(n_pages, max(0, operation.claimed_upto_pages))
-            if end <= claimed:
+            lower = max(
+                min(n_pages, max(0, operation.claimed_upto_pages)),
+                min(n_pages, max(0, operation.stop_line_pages)),
+            )
+            if end <= lower:
                 return
-            start = max(claimed, end - STORAGE_BATCH_SIZE)
+            start = max(lower, end - STORAGE_BATCH_SIZE)
             yield start, end
             end = start
 

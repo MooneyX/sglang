@@ -2381,6 +2381,17 @@ class Scheduler(
                             time.perf_counter() + race_wait_est * 2.0
                         )
 
+    # Contention-track stall escape hatch: consecutive _race_step checks
+    # with the GPU parked at the stop line M and zero prefetch progress
+    # before the GPU resumes recomputing toward fetched_from. Rounds are
+    # scheduler-loop iterations (lockstep across TP ranks), so the trigger
+    # is bit-identical on every rank; 128 rounds ~= 6-20s depending on
+    # load -- far longer than any legitimate IO batch, and the parked
+    # request's op is the IO thread's active op whenever cfe > 0 (the IO
+    # thread never preempts mid-op), so a zero-progress streak this long
+    # means a genuinely stuck backend, not queueing.
+    RACE_M_STALL_ROUNDS = 128
+
     def _race_step(self, req: Req, allow_trim: bool = True):
         """suffix_race consumption step (tail-first prefetch). Two ways to
         consume the fetched tail:
@@ -2419,6 +2430,8 @@ class Scheduler(
                 req.race_cap = None
                 req.race_boundary = None
                 req.race_progress_prev = None
+                req.race_stop_m = None
+                req.race_m_watch = None
                 req.race_t_consume = time.perf_counter()
             return
         if getattr(req, "race_fetch_start", None) is None:
@@ -2516,6 +2529,137 @@ class Scheduler(
         # None while no progress is known: the fetched region is still at the
         # tail, so no chunk can overshoot it and the adder imposes no limit.
         req.race_boundary = fetched_from if cfe > 0 else None
+
+        # ---- Contention-track stop line M (queue-gated, work-conserving) ----
+        # Idle track (waiting queue empty): no stop line -- the two sides
+        # race to the physical meeting point bounded only by claimed_upto.
+        # Free meeting is already optimal there (no queued victim), needs no
+        # rate estimate, and self-heals a stalled prefetch (the GPU simply
+        # recomputes to the end).
+        #
+        # Contention track (queue non-empty): both sides stop at the
+        # negotiated line M and the request completes by consuming the
+        # fetched tail, releasing the GPU (and the single IO thread) to the
+        # head-of-queue request. M is the measured-rate balance point of the
+        # window [cur, fetched_from]: with r = d_cur/(d_cur+d_cfe) sampled
+        # from frontier deltas (race_progress_ratio, integer permille, EWMA),
+        #   M = cur + (fetched_from - cur) * r / 1000.
+        # This is the balance equation Sum_tau_rec / duty = remaining * p_eff
+        # under the (calibrated) linear recompute model -- the pure per-token
+        # rate cancels, leaving the measured effective-rate ratio. All inputs
+        # are rank-consistent (cur identical by construction, cfe MIN-reduced,
+        # ratio from consensus integer deltas, waiting_queue identical), so M
+        # needs NO extra all-reduce. v1 deliberately omits the lambda*q_gain
+        # left-shift (global-throughput weighting): a misplaced M only makes
+        # the faster side wait at the tail -- bounded, one-directional, and
+        # never a hole or an overlap, since any M in [cur, fetched_from] is a
+        # valid split.
+        #
+        # M is clamped to [max(cur, extend_range.end), fetched_from]: the
+        # in-flight chunk is already committed GPU work, so the stop line can
+        # never undercut claimed_upto (invariant claimed_upto <= M).
+        #
+        # Work-conserving: the line binds only while the queue is non-empty.
+        # If the queue drains (or the prefetch stalls -- the watchdog below,
+        # same recovery action), the line is lifted and the GPU resumes
+        # toward fetched_from. This deliberately breaks the "only shrink"
+        # invariant on the fault/recovery path: it is a correctness
+        # backstop, not the efficiency path.
+        stop_m = getattr(req, "race_stop_m", None)
+        if stop_m is not None and cur >= stop_m:
+            # Parked at the line: FREEZE it (no rolling renegotiation).
+            # Recomputing M from the shrinking window here would random-walk
+            # the line rightward and churn park -> tiny chunk -> park.
+            pass
+        elif cfe > 0 and cur < fetched_from and self.waiting_queue:
+            ratio = tc.race_progress_ratio
+            if ratio is not None and 0 < ratio < 1000:
+                m = cur + (fetched_from - cur) * ratio // 1000
+                er = getattr(req, "extend_range", None)
+                if er is not None:
+                    m = max(m, er.end)
+                m = min(max(m, cur), fetched_from)
+                # Only a genuinely interior line is worth publishing: m==cur
+                # or m==fetched_from degenerates to the physical meeting.
+                if not (cur < m < fetched_from):
+                    m = None
+                if m != stop_m:
+                    log = (
+                        logger.info
+                        if stop_m is None or m is None
+                        else logger.debug
+                    )
+                    log(
+                        f"[RaceM] rid={req.rid} action={'set' if stop_m is None else 'update'} "
+                        f"M={m} cur={cur} fetched_from={fetched_from} "
+                        f"ratio={ratio} qlen={len(self.waiting_queue)}"
+                    )
+                stop_m = m
+            # No measured ratio yet: keep the previous line (if any); the
+            # window clamps above keep it valid as both frontiers advance.
+        elif stop_m is not None and (cfe == 0 or cur < fetched_from):
+            # Work-conserving lift: the queue drained (or the window
+            # vanished), so the stop line's reason to exist is gone. The GPU
+            # resumes toward fetched_from and the prefetch may resume below
+            # the line (still bounded by claimed_upto) if its op is alive.
+            logger.info(
+                f"[RaceM] rid={req.rid} action=lift reason=queue_drained "
+                f"M={stop_m} cur={cur} fetched_from={fetched_from}"
+            )
+            stop_m = None
+        req.race_stop_m = stop_m
+
+        # The fetched boundary only moves left, so a kept line can end up
+        # outside the shrunk window; clamp it back (never below cur -- a
+        # line at/under cur is the parked state, which must survive).
+        if stop_m is not None and stop_m > fetched_from:
+            stop_m = fetched_from
+            req.race_stop_m = stop_m
+
+        # Stall escape hatch: parked at M (cur reached the line) with the
+        # prefetch making zero progress for RACE_M_STALL_ROUNDS consecutive
+        # checks -> lift the line and let the GPU recompute toward
+        # fetched_from. Free meeting has this property natively; the fixed
+        # line must recover it explicitly, or a stuck backend would hang the
+        # request at M forever. Counter + MIN-reduced cfe are lockstep across
+        # ranks, so the trigger needs no vote.
+        if stop_m is not None and stop_m <= cur < fetched_from:
+            cfe_last, stall_rounds = getattr(req, "race_m_watch", None) or (
+                cfe,
+                0,
+            )
+            if cfe > cfe_last:
+                req.race_m_watch = (cfe, 0)
+            else:
+                stall_rounds += 1
+                req.race_m_watch = (cfe_last, stall_rounds)
+                if stall_rounds >= self.RACE_M_STALL_ROUNDS:
+                    logger.info(
+                        f"[RaceM] rid={req.rid} action=stall_resume "
+                        f"M={stop_m} cur={cur} fetched_from={fetched_from} "
+                        f"rounds={stall_rounds}"
+                    )
+                    stop_m = None
+                    req.race_stop_m = None
+                    req.race_m_watch = None
+        else:
+            req.race_m_watch = None
+
+        if stop_m is not None:
+            # GPU side: chunks are capped at M (race_chunk_limit reads
+            # race_boundary) and the request parks at M until the prefetch
+            # arrives; the meeting path then consumes [M, fetch_end).
+            req.race_boundary = stop_m
+            # Prefetch side: soft-stop fetching below M's page (op-local
+            # units). Floor keeps M's own page fetched, so the meeting can
+            # fire as soon as cur reaches M.
+            op.stop_line_pages = min(
+                len(op.hash_value),
+                max(0, (stop_m - req.race_fetch_start) // tc.page_size),
+            )
+        elif getattr(op, "stop_line_pages", 0):
+            op.stop_line_pages = 0
+
         if cfe > 0 and cur >= fetched_from:
             # Meeting point: everything beyond cur has been fetched.
             n = fetch_end - cur
@@ -2598,6 +2742,10 @@ class Scheduler(
         # Progress tracking is per-race: a stale (cur, cfe) pair from a
         # finished race would make the next race's first delta meaningless.
         req.race_progress_prev = None
+        # Contention-track stop-line state dies with the race (the op itself
+        # is terminated inside race_finalize_prefetch).
+        req.race_stop_m = None
+        req.race_m_watch = None
         logger.info(
             f"[RaceFinalize] rid={req.rid} "
             f"prefetch_len={m.get('prefetch_len', 0)} "
@@ -2976,13 +3124,25 @@ class Scheduler(
 
         Safety: parking keeps self.chunked_req set, so the admission loop
         sees has_chunked_req=True and cannot create a second chunked request
-        (SKIP_REQ, commit 4a6039c1d) -- the singleton invariant holds. The
-        park lasts at most one round: once the in-flight chunk commits, cur
-        >= boundary and the meeting path consumes.
+        (SKIP_REQ, commit 4a6039c1d) -- the singleton invariant holds. On the
+        idle track the park lasts at most one round: once the in-flight
+        chunk commits, cur >= boundary and the meeting path consumes. On the
+        contention track (boundary = negotiated stop line M) the park lasts
+        until the prefetch covers down to M -- bounded by the
+        RACE_M_STALL_ROUNDS escape hatch in _race_step, which lifts the line
+        and lets the GPU resume if the prefetch stops making progress.
         """
         boundary = getattr(req, "race_boundary", None)
         if boundary is None:
             return False
+        # The committed frontier already sits at the line: keep parking
+        # until the meeting path can consume. Two sub-cases: (a) contention
+        # track -- boundary is the stop line M and the prefetch has not
+        # covered down to it yet (chunks are capped at M, so there is
+        # nothing more to schedule); (b) a meeting load failed last round
+        # (LOAD_FAILED) and is retried this round.
+        if len(req.prefix_indices) >= boundary:
+            return True
         er = getattr(req, "extend_range", None)
         if er is None:
             return False
